@@ -6174,6 +6174,13 @@
             "screen_detection_skipped": {
               "type": "boolean"
             },
+            "server_epoch": {
+              "description": "Non-persisted token identifying THIS server incarnation.\n\nMinted in memory once per server process and never written anywhere,\nso a saved session snapshot cannot carry a value matching the current\nprocess. A consumer that recorded this token and later sees a\ndifferent one knows the server restarted or handed off; a consumer\nholding only a snapshot cannot manufacture one at all. This is the\nfield that lets \"is this session live?\" be answered from the API\nrather than assumed from metadata that a stale snapshot also has.\nAbsent means UNAVAILABLE, never \"the empty epoch\". Modelled as an\noption rather than a defaulted `String` because a bare `String` with\n`#[serde(default)]` deserialises a missing field to `\"\"`, and an empty\ntoken is indistinguishable from a real one at the type level — a\nconsumer comparing epochs would see two absent servers as \"equal\".",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "state_change_seq": {
               "default": 0,
               "format": "uint64",
@@ -9843,6 +9850,13 @@
               "format": "uint32",
               "minimum": 0,
               "type": "integer"
+            },
+            "server_epoch": {
+              "description": "The server incarnation this snapshot was taken from. Absent means\nUNAVAILABLE, never \"the empty epoch\".\n\nCarried here as WELL as on `AgentInfo` because the token is otherwise\nobservable only when an agent exists — and the staleness case it\nexists to detect is precisely the one where the agent may be gone. A\nconsumer must be able to ask \"which incarnation am I talking to?\"\nwithout one.\n\nThis is the API snapshot (`src/api/schema/session.rs`), which is a\nRESPONSE type. It is deliberately NOT `persist::SessionSnapshot`\n(`src/persist/snapshot.rs`), the type written to disk by\n`persist::io::save` — putting a non-persisted incarnation token into a\npersisted structure would manufacture the exact stale-snapshot forgery\nthis field exists to make detectable.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "tabs": {
               "items": {

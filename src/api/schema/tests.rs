@@ -674,6 +674,10 @@ fn session_snapshot_request_and_response_round_trip() {
                 panes: Vec::new(),
                 layouts: Vec::new(),
                 agents: Vec::new(),
+                // Absent is the honest value here: this snapshot is built by a
+                // test, not served by a running server, and a fabricated token
+                // is the exact forgery the field exists to expose.
+                server_epoch: None,
             }),
         },
     };
@@ -1317,4 +1321,46 @@ fn popup_close_request_round_trips() {
 
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
+}
+
+/// The incarnation token is only useful if a CONSUMER can observe it, so the
+/// value has to survive the wire. `skip_serializing_if` plus `serde(default)`
+/// is exactly the pairing that can drop one silently: a bug that omits the
+/// field and a server that legitimately has no token produce byte-identical
+/// JSON. Absence is tested by every other snapshot case; this pins the other
+/// half, which is the half the security property rests on.
+#[test]
+fn server_epoch_survives_the_wire_both_present_and_absent() {
+    let mut snapshot = SessionSnapshot {
+        version: "0.1.2".into(),
+        protocol: 16,
+        focused_workspace_id: None,
+        focused_tab_id: None,
+        focused_pane_id: None,
+        workspaces: Vec::new(),
+        tabs: Vec::new(),
+        panes: Vec::new(),
+        layouts: Vec::new(),
+        agents: Vec::new(),
+        server_epoch: Some("0123456789abcdef0123456789abcdef".into()),
+    };
+
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(
+        json["server_epoch"], "0123456789abcdef0123456789abcdef",
+        "a present token must be emitted, not skipped"
+    );
+    let restored: SessionSnapshot = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.server_epoch, snapshot.server_epoch);
+
+    // Absent must stay absent rather than becoming an empty string: a consumer
+    // must never be able to read "no epoch" as "the empty epoch".
+    snapshot.server_epoch = None;
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert!(
+        json.get("server_epoch").is_none(),
+        "an absent token must be omitted entirely, got {json}"
+    );
+    let restored: SessionSnapshot = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.server_epoch, None);
 }

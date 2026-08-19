@@ -71,7 +71,15 @@ fn load_stored_from_path(path: &Path) -> Option<StoredReleaseNotes> {
 }
 
 pub fn load_latest() -> Option<ReleaseNotes> {
-    load_latest_from_path(&pending_path(), &crate::build_info::version())
+    // BASE_VERSION, not version(): this argument is used ONLY for a semver
+    // comparison, while version() is a display composition. Version::parse
+    // requires exactly three dot-separated numbers, so a composed identity
+    // like "0.8.0-heb.1" (any non-stable channel, including upstream preview
+    // builds) parses to None and the match below falls to `_ => false`,
+    // silently disabling newer-release-notes detection. Passing the display
+    // string was only ever correct because the stable channel makes the two
+    // equal.
+    load_latest_from_path(&pending_path(), crate::build_info::BASE_VERSION)
 }
 
 fn load_latest_from_path(path: &Path, current_version: &str) -> Option<ReleaseNotes> {

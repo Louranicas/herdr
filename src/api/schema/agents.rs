@@ -215,6 +215,22 @@ pub struct AgentInfo {
     pub interactive_ready: bool,
     #[serde(default)]
     pub state_change_seq: u64,
+    /// Non-persisted token identifying THIS server incarnation.
+    ///
+    /// Minted in memory once per server process and never written anywhere,
+    /// so a saved session snapshot cannot carry a value matching the current
+    /// process. A consumer that recorded this token and later sees a
+    /// different one knows the server restarted or handed off; a consumer
+    /// holding only a snapshot cannot manufacture one at all. This is the
+    /// field that lets "is this session live?" be answered from the API
+    /// rather than assumed from metadata that a stale snapshot also has.
+    /// Absent means UNAVAILABLE, never "the empty epoch". Modelled as an
+    /// option rather than a defaulted `String` because a bare `String` with
+    /// `#[serde(default)]` deserialises a missing field to `""`, and an empty
+    /// token is indistinguishable from a real one at the type level — a
+    /// consumer comparing epochs would see two absent servers as "equal".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_epoch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

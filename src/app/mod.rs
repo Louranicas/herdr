@@ -2865,7 +2865,7 @@ mod tests {
         crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
             .unwrap();
         crate::product_announcements::save_manifest_announcement(
-            env!("CARGO_PKG_VERSION"),
+            &crate::build_info::version(),
             Some(&crate::product_announcements::ManifestAnnouncement {
                 id: "startup-announcement".into(),
                 title: Some("Startup announcement".into()),

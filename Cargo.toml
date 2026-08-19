@@ -30,6 +30,10 @@ ctrlc = { version = "3", features = ["termination"] }
 interprocess = "2.4.2"
 jsonc-parser = { version = "0.33.1", default-features = false, features = ["cst", "serde_json"] }
 libc = "0.2"
+# Bounded, cross-platform OS entropy for the server-incarnation token.
+# Already present transitively; a direct dependency adds no new supply-chain
+# surface and keeps the OS call out of platform-specific code entirely.
+getrandom = "0.3"
 portable-pty = "=0.9.0"
 png = "0.17"
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }

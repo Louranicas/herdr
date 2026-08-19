@@ -53,6 +53,7 @@ impl App {
             panes: self.collect_panes_for_workspace(None).unwrap_or_default(),
             layouts,
             agents: self.collect_agent_infos(),
+            server_epoch: crate::server_epoch::server_epoch().map(str::to_string),
         }
     }
 }

@@ -284,6 +284,32 @@ fn event_by_kind<'a>(events: &'a [serde_json::Value], kind: &str) -> &'a serde_j
         .unwrap_or_else(|| panic!("missing event {kind}"))
 }
 
+/// The version the running binary reports, recomposed from the SAME
+/// compile-time inputs `build_info::version()` uses.
+///
+/// Not a second subprocess: `spawn_herdr` and this test crate are both built
+/// from `CARGO_BIN_EXE_herdr`, so comparing one against the other compares a
+/// constant with itself and cannot fail. Cargo's `[env]` applies to rustc for
+/// this crate too, so the composition here sees exactly what the binary saw -
+/// which keeps the assertion exact on a stock build AND on a forked one,
+/// instead of trading a real check for a tautology.
+fn expected_version() -> String {
+    let channel = option_env!("HERDR_BUILD_CHANNEL")
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or("stable");
+    if channel == "stable" {
+        return env!("CARGO_PKG_VERSION").to_string();
+    }
+    match option_env!("HERDR_BUILD_ID")
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        Some(build_id) => format!("{}-{channel}.{build_id}", env!("CARGO_PKG_VERSION")),
+        None => format!("{}-{channel}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 #[test]
 fn ping_over_socket_returns_version() {
     let _lock = test_lock();
@@ -301,9 +327,17 @@ fn ping_over_socket_returns_version() {
     );
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
-    assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
-    // Intentionally hardcoded so wire protocol bumps require updating this test.
-    // Changing this value means old clients/servers are no longer compatible.
+    // Pinning CARGO_PKG_VERSION here asserted that the running build is STOCK.
+    // That is false for any non-stable channel: build_info::version() composes
+    // "{version}-{channel}.{build_id}", so a fork build - or an upstream
+    // preview build - serves a different string by design. Recomposed from the
+    // same compile-time inputs, so the check stays exact either way.
+    assert_eq!(value["result"]["version"], expected_version());
+    assert!(
+        expected_version().starts_with(env!("CARGO_PKG_VERSION")),
+        "the served identity must still be rooted in the package version"
+    );
+
     assert_eq!(value["result"]["protocol"], 20);
 
     cleanup_spawned_herdr(child, base);
