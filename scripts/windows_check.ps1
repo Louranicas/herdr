@@ -63,7 +63,10 @@ function Get-CargoTestNames {
         throw "$Description selected zero tests"
     }
 
-    return ,$names
+    # No leading comma: both callers wrap this in @(), which already keeps a
+    # single name an array. Returning ,$names on top of that nests the array
+    # inside a one-element array, so -contains and .Count silently stop working.
+    return $names
 }
 
 function Invoke-CargoTestFilter {
