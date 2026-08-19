@@ -456,7 +456,8 @@ fn fork_update_source() -> Option<String> {
 /// `manager` decides the remedy rather than the refusal. "Update it the way it
 /// was installed" is the wrong sentence to hand a manager-managed build on
 /// this channel: the manager's herdr package is upstream's, so following that
-/// advice performs by hand exactly the replacement being refused.
+/// advice performs by hand exactly the replacement being refused. It also
+/// withdraws the source route, for the same reason `windows` does.
 fn unpublished_channel_update_refusal(
     channel: &str,
     fork_source: Option<&str>,
@@ -475,11 +476,13 @@ fn unpublished_channel_update_refusal(
         ),
         None => "install a new build of it the way this one was installed".to_string(),
     };
-    // Naming the variable here would send a Windows operator into a loop: the
-    // advice is to set it, and setting it is refused on this platform because
-    // the Windows path installs through upstream's script rather than the
-    // asset a manifest names.
-    let route_out = if windows {
+    // Naming the variable is advice only where setting it is not itself
+    // refused, and this same composition refuses it twice: on Windows,
+    // because that install path discards the asset a manifest names, and on a
+    // manager-owned install, because the manager updates from its own package.
+    // In either case the operator would set it, be refused, and be told to set
+    // it again. The remedy below is the route that survives.
+    let route_out = if windows || manager.is_some() {
         String::new()
     } else {
         format!("set {FORK_UPDATE_SOURCE_ENV} to a manifest URL for this build's own channel, or ")
@@ -592,13 +595,17 @@ fn published_channel_rejects_update_source(
 /// manager's next upgrade, and the location may not even be writable. A
 /// conflict stated is better than an update half-performed.
 ///
-/// `channel` decides only the second remedy. On a published channel the
-/// manager's package really is another way to get this build, so offering it
-/// is sound. On a channel no published release carries it is not: unsetting
-/// the variable there leads to `unpublished_channel_update_refusal`, and
-/// following the advice by hand installs upstream over the build that just
-/// named a different source - the refusal above defeated by the sentence
-/// underneath it.
+/// `channel` decides only the second remedy, and only one arm of it is ever
+/// read. `update_refusal` answers a published channel with a source set from
+/// `published_channel_rejects_update_source` before reaching here, so the
+/// published remedy is a defensive default for a direct caller rather than a
+/// sentence an operator can see; `every_dispatch_refuses_the_same_cases`
+/// pins that ordering. The unpublished arm is the live one, and it must not
+/// offer the manager: no published release carries that channel, so unsetting
+/// the variable leads to `unpublished_channel_update_refusal`, and following
+/// the advice by hand installs upstream over the build that just named a
+/// different source - the refusal above defeated by the sentence underneath
+/// it.
 fn update_source_conflicts_with_manager(
     channel: &str,
     fork_source: Option<&str>,
@@ -4409,16 +4416,59 @@ mod tests {
         }
 
         // A published channel keeps the remedy, because there the manager's
-        // package really does describe this build.
-        let published = update_source_conflicts_with_manager(
-            "stable",
-            Some("https://example.invalid/fork.json"),
-            Some("Homebrew"),
-        )
-        .expect("a configured source conflicts with a manager");
+        // package really does describe this build. It is a defensive default
+        // for a direct caller rather than a sentence an operator reads:
+        // `update_refusal` answers the published case before this function
+        // runs, which `every_dispatch_refuses_the_same_cases` pins.
+        let source = Some("https://example.invalid/fork.json");
+        let published = update_source_conflicts_with_manager("stable", source, Some("Homebrew"))
+            .expect("a configured source conflicts with a manager");
         assert!(
             published.contains("update it through Homebrew"),
             "a stable build may be told to unset the source and use its manager: {published}"
+        );
+        assert_ne!(
+            update_refusal("stable", source, Some("Homebrew"), false),
+            Some(published),
+            "the published remedy must stay unreachable through the composed policy"
+        );
+    }
+
+    /// The same loop the Windows refusal closed, on a manager-owned install.
+    ///
+    /// Setting the variable is refused for any build a manager owns, so
+    /// advising it there would send the operator to a refusal and back. The
+    /// remedy - install this build directly - is the one that leads somewhere,
+    /// and it is where the variable becomes usable.
+    #[test]
+    fn a_manager_owned_build_is_not_sent_to_a_setting_it_refuses() {
+        for manager in ["Homebrew", "mise", "Nix"] {
+            let managed = unpublished_channel_update_refusal("heb", None, Some(manager), false)
+                .expect("an unpublished channel must refuse to self-update");
+            assert!(
+                !managed.contains(FORK_UPDATE_SOURCE_ENV),
+                "{manager} refuses a configured source, so it must not be advised: {managed}"
+            );
+            assert!(
+                managed.contains("install a new build of it directly"),
+                "the remedy that does lead somewhere must remain: {managed}"
+            );
+            // The refusal the withdrawn advice would have walked into.
+            assert!(update_refusal(
+                "heb",
+                Some("https://example.invalid/fork.json"),
+                Some(manager),
+                false
+            )
+            .is_some_and(|message| message.contains(manager)));
+        }
+
+        // A direct install is where the route is real, so it must keep it.
+        let direct = unpublished_channel_update_refusal("heb", None, None, false)
+            .expect("an unpublished channel must refuse to self-update");
+        assert!(
+            direct.contains(FORK_UPDATE_SOURCE_ENV),
+            "a direct install can honour a configured source: {direct}"
         );
     }
 
