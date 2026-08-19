@@ -25,8 +25,14 @@ use serde::{Deserialize, Deserializer};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+/// A manifest URL for a build whose channel no published manifest describes.
+///
+/// Without this a fork has only two options, and both are wrong: never update,
+/// or update itself into an upstream binary.
+const FORK_UPDATE_SOURCE_ENV: &str = "HERDR_UPDATE_SOURCE";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
+const HTTPS_SCHEME: &str = "https://";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
@@ -86,6 +92,138 @@ impl Version {
 
     pub fn current() -> Self {
         Self::parse(crate::build_info::BASE_VERSION).expect("invalid CARGO_PKG_VERSION")
+    }
+}
+
+/// How a channel's build ids are ordered.
+///
+/// The real preview id is `<YYYY-MM-DD>-<12 hex>` - `build_id="$day-$short_sha"`
+/// in `.github/workflows/preview.yml` - producing identities like
+/// `0.8.0-preview.2026-06-02-abcdef123456`. An earlier revision here assumed a
+/// bare number, failed to parse that, and swallowed the whole tail into the
+/// CHANNEL name; two successive previews then looked like two different
+/// channels and compared as not-comparable. The parser has to know the shape
+/// the project actually emits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildOrder {
+    /// A plain counter, e.g. the fork's own `heb.1`.
+    Numeric(u64),
+    /// `YYYY-MM-DD-<sha>`. ISO dates sort lexicographically as they sort
+    /// chronologically, which is the only reason comparing them as strings is
+    /// sound.
+    Dated { date: String, sha: String },
+    /// Anything else. Equal to itself and ordered against nothing, rather than
+    /// silently ranked by whatever the bytes happen to be.
+    Opaque(String),
+}
+
+impl BuildOrder {
+    fn parse(raw: &str) -> Self {
+        if let Ok(n) = raw.parse::<u64>() {
+            return Self::Numeric(n);
+        }
+        // `YYYY-MM-DD-<rest>`: exactly three leading dash-separated fields of
+        // 4/2/2 digits, then the commit.
+        let parts: Vec<&str> = raw.splitn(4, '-').collect();
+        if parts.len() == 4
+            && parts[0].len() == 4
+            && parts[1].len() == 2
+            && parts[2].len() == 2
+            && parts[..3]
+                .iter()
+                .all(|p| p.bytes().all(|b| b.is_ascii_digit()))
+            && !parts[3].is_empty()
+        {
+            return Self::Dated {
+                date: format!("{}-{}-{}", parts[0], parts[1], parts[2]),
+                sha: parts[3].to_string(),
+            };
+        }
+        Self::Opaque(raw.to_string())
+    }
+
+    /// `None` where no defensible order exists.
+    fn is_after(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Numeric(a), Self::Numeric(b)) => Some(a > b),
+            (Self::Dated { date: da, sha: sa }, Self::Dated { date: db, sha: sb }) => {
+                if da == db {
+                    // Same day, different commit: nothing here says which came
+                    // first, and guessing would be inventing a release order.
+                    if sa == sb {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(da > db)
+                }
+            }
+            (Self::Opaque(a), Self::Opaque(b)) if a == b => Some(false),
+            // Mixed or unrecognised shapes have no order.
+            _ => None,
+        }
+    }
+}
+
+/// A full build identity: a release version plus, for a non-stable channel, the
+/// channel and its build id - exactly what `build_info::version()` emits.
+///
+/// `Version` alone cannot order these. It carries major/minor/patch only, and
+/// fails its three-part parse on any pre-release at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildIdentity {
+    pub version: Version,
+    /// `None` on the stable channel. `Some((channel, build))` otherwise.
+    pub pre: Option<(String, BuildOrder)>,
+}
+
+impl BuildIdentity {
+    /// Accepts `X.Y.Z`, `X.Y.Z-channel`, and `X.Y.Z-channel.<build-id>`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let (core, pre) = match s.split_once('-') {
+            None => (s, None),
+            Some((core, rest)) => {
+                // The channel is everything before the FIRST dot; the build id
+                // is the remainder, which may itself contain dashes.
+                let (channel, build) = match rest.split_once('.') {
+                    Some((channel, build)) => (channel.to_string(), BuildOrder::parse(build)),
+                    None => (rest.to_string(), BuildOrder::Numeric(0)),
+                };
+                if channel.is_empty() {
+                    return None;
+                }
+                (core, Some((channel, build)))
+            }
+        };
+        Some(Self {
+            version: Version::parse(core)?,
+            pre,
+        })
+    }
+
+    pub fn is_newer_than(&self, other: &Self) -> Option<bool> {
+        use std::cmp::Ordering;
+        match self.version.cmp(&other.version) {
+            Ordering::Greater => return Some(true),
+            Ordering::Less => return Some(false),
+            Ordering::Equal => {}
+        }
+        match (&self.pre, &other.pre) {
+            (None, None) => Some(false),
+            // Semver: a release outranks any pre-release of the same version.
+            (None, Some(_)) => Some(true),
+            (Some(_), None) => Some(false),
+            (Some((ac, an)), Some((bc, bn))) => {
+                if ac == bc {
+                    an.is_after(bn)
+                } else {
+                    // Different channels, same release: no order.
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -236,16 +374,21 @@ impl UpdateManifest {
             .map(|asset| asset.url.clone())
     }
 
-    fn metadata_for_version(&self, version: &Version) -> Option<ManifestReleaseMetadata> {
-        let version = version.to_string();
-        if self.version.trim_start_matches('v') == version {
+    /// Metadata for the release this manifest declares as `identity`.
+    ///
+    /// Keyed by the declared identity string rather than by a normalised
+    /// `Version`, because a manifest for a channel that carries build ids
+    /// declares something like `0.8.0-heb.2`, which no three-part version can
+    /// represent. For a plain `X.Y.Z` release the two are the same string.
+    fn metadata_for_release(&self, identity: &str) -> Option<ManifestReleaseMetadata> {
+        if self.version.trim_start_matches('v') == identity {
             return Some(ManifestReleaseMetadata {
                 notes: self.notes.clone(),
                 announcement: self.announcement.clone(),
             });
         }
 
-        self.releases.get(&version).and_then(|release| {
+        self.releases.get(identity).and_then(|release| {
             let metadata =
                 serde_json::from_value::<ManifestReleaseMetadata>(release.clone()).ok()?;
             (!metadata.notes_body().is_empty()).then_some(metadata)
@@ -284,12 +427,313 @@ impl ReleaseInfo {
     }
 }
 
+/// An explicitly configured update source, if one is set and non-empty.
+fn fork_update_source() -> Option<String> {
+    env::var(FORK_UPDATE_SOURCE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Why a build on `channel` must not resolve an update from a published
+/// manifest, when that is the case.
+///
+/// The mirror of `remote::attach`'s refusal, for the opposite direction.
+/// Auto-install decides which binary to PUT on a remote host; this decides
+/// which binary to REPLACE THIS ONE WITH, so getting it wrong is worse: a fork
+/// silently updates itself into upstream and the fork's changes are gone.
+///
+/// The leak was not in a channel comparison but in the version one.
+/// `Version::current()` parses `BASE_VERSION`, which is the bare package
+/// version with the channel suffix already discarded - so a `0.8.0-heb.1`
+/// build compares as plain `0.8.0`, upstream `0.8.1` reads as strictly newer,
+/// and the update is offered. Nothing in that path ever sees `heb`.
+///
+/// `channel` is a parameter rather than a call to `build_info::channel()`
+/// because that is a compile-time constant: on this fork it is always `heb`,
+/// so a test could never exercise the stable or preview cases.
+///
+/// `manager` decides the remedy rather than the refusal. "Update it the way it
+/// was installed" is the wrong sentence to hand a manager-managed build on
+/// this channel: the manager's herdr package is upstream's, so following that
+/// advice performs by hand exactly the replacement being refused. It also
+/// withdraws the source route, for the same reason `windows` does.
+fn unpublished_channel_update_refusal(
+    channel: &str,
+    fork_source: Option<&str>,
+    manager: Option<&str>,
+    windows: bool,
+) -> Option<String> {
+    if crate::build_info::is_published_channel(channel) {
+        return None;
+    }
+    if fork_source.is_some_and(|source| !source.trim().is_empty()) {
+        return None;
+    }
+    let remedy = match manager {
+        Some(manager) => format!(
+            "install a new build of it directly. {manager}'s herdr package is upstream's, so updating through {manager} would replace this build with the same unrelated binary"
+        ),
+        None => "install a new build of it the way this one was installed".to_string(),
+    };
+    // Naming the variable is advice only where setting it is not itself
+    // refused, and this same composition refuses it twice: on Windows,
+    // because that install path discards the asset a manifest names, and on a
+    // manager-owned install, because the manager updates from its own package.
+    // In either case the operator would set it, be refused, and be told to set
+    // it again. The remedy below is the route that survives.
+    let route_out = if windows || manager.is_some() {
+        String::new()
+    } else {
+        format!("set {FORK_UPDATE_SOURCE_ENV} to a manifest URL for this build's own channel, or ")
+    };
+    Some(format!(
+        "this herdr is built on the `{channel}` channel, which no published release manifest describes, so updating from one would replace this build with an unrelated upstream binary; {route_out}{remedy}"
+    ))
+}
+
+/// Why a configured update source cannot be fetched as given.
+///
+/// The manifest names both the asset URL and the SHA-256 that asset is
+/// verified against, so whoever chooses the manifest chooses the binary. Over
+/// plain `http` that is whoever is on the network path, and the checksum then
+/// verifies the substituted bytes against the substituted digest - the
+/// integrity chain checking the attacker's work against itself. `file://` and
+/// every other scheme curl accepts land in the same place, and a value
+/// beginning with `-` is read by curl as an option rather than a URL, because
+/// the source is passed as a positional argument.
+///
+/// Refusing rather than falling back to the published URL is the same rule the
+/// escape hatch already follows: an operator who named a source and silently
+/// received upstream's is the leak this whole path exists to close.
+fn unusable_update_source_refusal(fork_source: Option<&str>) -> Option<String> {
+    let source = fork_source.map(str::trim).filter(|s| !s.is_empty())?;
+    if source.starts_with(HTTPS_SCHEME) && source.len() > HTTPS_SCHEME.len() {
+        return None;
+    }
+    Some(format!(
+        "{FORK_UPDATE_SOURCE_ENV} is set to {source}, but an update source must be an `https://` URL; the manifest names both the binary to install and the checksum that binary is checked against, so one fetched over a transport anyone on the path can rewrite verifies whatever was substituted for it"
+    ))
+}
+
+/// The manifest a published channel uses, or the configured fork source.
+///
+/// A configured source REPLACES the upstream URL rather than merely unlocking
+/// it. Letting the escape hatch fall through to `herdr.dev` would reopen the
+/// leak behind a flag, which is worse than having no escape hatch at all -
+/// the operator would have asked for their own source and silently got
+/// upstream's.
+///
+/// It only applies where it is needed. On a published channel nothing is
+/// refused, so redirecting the fetch would buy no capability and would instead
+/// hand the environment control of which binary replaces this one: the
+/// manifest names both the asset URL and the SHA-256 it is verified against,
+/// so a manifest chosen by the caller verifies whatever it likes.
+fn manifest_url(published: &str) -> String {
+    resolve_manifest_url(
+        published,
+        crate::build_info::channel(),
+        fork_update_source().as_deref(),
+    )
+}
+
+/// The name of the install manager that owns this binary, if one does.
+///
+/// Returned as a name rather than a bool because the refusals below have to
+/// say WHICH manager conflicts; "this install is managed" leaves the operator
+/// to guess which of three it means.
+fn managed_install_name() -> Option<&'static str> {
+    if is_homebrew_managed_install() {
+        return Some("Homebrew");
+    }
+    if is_mise_managed_install() {
+        return Some("mise");
+    }
+    if is_nix_managed_install() {
+        return Some("Nix");
+    }
+    None
+}
+
+/// Why a configured update source cannot be honoured on a published channel.
+///
+/// `resolve_manifest_url` deliberately ignores the override here, and the
+/// reason is sound: the manifest names both the asset URL and the SHA-256 that
+/// asset is verified against, so a manifest chosen by the environment verifies
+/// whatever it likes. Honouring it on a stock build would let anything able to
+/// set a variable choose the binary that replaces it.
+///
+/// But ignoring it SILENTLY is its own failure. The operator stated where
+/// updates should come from and then got upstream's, with nothing said. The
+/// setting is refused out loud instead.
+fn published_channel_rejects_update_source(
+    channel: &str,
+    fork_source: Option<&str>,
+) -> Option<String> {
+    if !crate::build_info::is_published_channel(channel) {
+        return None;
+    }
+    let source = fork_source.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(format!(
+        "{FORK_UPDATE_SOURCE_ENV} is set to {source}, but this build is on the published `{channel}` channel, whose updates come from the release manifest and are verified against the checksum it publishes; honouring an environment-chosen manifest here would let it name both the binary and the checksum it is checked against. Unset {FORK_UPDATE_SOURCE_ENV} to update from the {channel} manifest"
+    ))
+}
+
+/// Why a configured update source cannot be delivered through an install
+/// manager.
+///
+/// This is the half a refusal at the fetch cannot reach. With a source
+/// configured the fork refusal lifts, and the manager branches then run: the
+/// Homebrew path returns before `check_latest` is ever called and offers
+/// `brew upgrade herdr`, which installs upstream's formula. The notes would be
+/// read from the configured manifest and the binary taken from somewhere else
+/// entirely - the two halves of an update disagreeing about what is being
+/// installed.
+///
+/// Refusing rather than installing directly is deliberate. The manager owns
+/// the prefix this binary lives in; writing over it would be reverted by the
+/// manager's next upgrade, and the location may not even be writable. A
+/// conflict stated is better than an update half-performed.
+///
+/// `channel` decides only the second remedy, and only one arm of it is ever
+/// read. `update_refusal` answers a published channel with a source set from
+/// `published_channel_rejects_update_source` before reaching here, so the
+/// published remedy is a defensive default for a direct caller rather than a
+/// sentence an operator can see; `every_dispatch_refuses_the_same_cases`
+/// pins that ordering. The unpublished arm is the live one, and it must not
+/// offer the manager: no published release carries that channel, so unsetting
+/// the variable leads to `unpublished_channel_update_refusal`, and following
+/// the advice by hand installs upstream over the build that just named a
+/// different source - the refusal above defeated by the sentence underneath
+/// it.
+fn update_source_conflicts_with_manager(
+    channel: &str,
+    fork_source: Option<&str>,
+    manager: Option<&str>,
+) -> Option<String> {
+    let source = fork_source.map(str::trim).filter(|s| !s.is_empty())?;
+    let manager = manager?;
+    let remedy = if crate::build_info::is_published_channel(channel) {
+        format!("or unset {FORK_UPDATE_SOURCE_ENV} and update it through {manager}")
+    } else {
+        format!(
+            "and note that unsetting {FORK_UPDATE_SOURCE_ENV} is not the other way out here: no published release carries the `{channel}` channel, so {manager}'s package would replace this build with an upstream one"
+        )
+    };
+    Some(format!(
+        "{FORK_UPDATE_SOURCE_ENV} is set to {source}, but this herdr was installed through {manager}, which updates from its own upstream package; taking release notes from one source and the binary from another would install something other than what was described. Install this build directly to update it from {source}, {remedy}"
+    ))
+}
+
+/// Every reason this build must not perform an update, or `None` when none
+/// applies.
+///
+/// One owner rather than a block repeated at each dispatch point. The three
+/// callers - the fetch, the manual update and the background check - have to
+/// refuse identically, and composing the policies separately at each made the
+/// order they happened to be written in load-bearing: `check_latest` omitted
+/// the manager conflict entirely, which was harmless only for as long as both
+/// of its callers checked it first.
+///
+/// Ordered so the message names the operator's nearest problem: a published
+/// channel is told to unset the variable rather than to fix its scheme, and a
+/// source that cannot be fetched is reported as such rather than as a missing
+/// one.
+fn update_refusal(
+    channel: &str,
+    fork_source: Option<&str>,
+    manager: Option<&str>,
+    windows: bool,
+) -> Option<String> {
+    published_channel_rejects_update_source(channel, fork_source)
+        // Ahead of fetchability and of the manager conflict: both of those
+        // answer "install directly to update from your source", which Windows
+        // cannot do either, so their advice would be wrong here.
+        .or_else(|| update_source_unsupported_on_windows(fork_source, windows))
+        .or_else(|| unusable_update_source_refusal(fork_source))
+        .or_else(|| unpublished_channel_update_refusal(channel, fork_source, manager, windows))
+        .or_else(|| update_source_conflicts_with_manager(channel, fork_source, manager))
+}
+
+/// [`update_refusal`] asked about the running build.
+fn current_update_refusal() -> Option<String> {
+    update_refusal(
+        crate::build_info::channel(),
+        fork_update_source().as_deref(),
+        managed_install_name(),
+        cfg!(windows),
+    )
+}
+
+/// Whether the preview manifest is the shape this build fetches.
+///
+/// The configured channel selects between the two PUBLISHED manifests. A build
+/// on an unpublished channel fetches neither: `manifest_url` redirects both to
+/// the configured source, which describes that build's own channel. Routing it
+/// through the preview parser would reject it for not declaring `preview`,
+/// while `manifest_release_should_install` requires the opposite - that the
+/// manifest declare the running build's channel - so the two cannot be
+/// satisfied at once. A fork that had ever run `herdr channel set preview`
+/// therefore saw its escape hatch fail as a JSON parse error, over a setting
+/// that no longer selects anything for it.
+fn fetches_preview_manifest(channel: &str, configured: UpdateChannel) -> bool {
+    crate::build_info::is_published_channel(channel) && configured == UpdateChannel::Preview
+}
+
+/// Why a configured update source cannot be honoured on Windows.
+///
+/// The Windows install path does not use the manifest's asset at all.
+/// `install_windows_update_with_installer` runs
+/// `irm https://herdr.dev/install.ps1 | iex` and passes it only a channel and
+/// a build id; the `download_url` and `sha256` the manifest supplied are
+/// discarded. So a configured source decides the notes and whether an update
+/// is offered, and upstream's installer then decides the binary - the same
+/// mixing the manager refusal prevents, except here the two halves cannot be
+/// separated by choosing a different install method, because there is only
+/// one.
+///
+/// Refusing is the conservative resolution. Honouring the source would mean
+/// implementing a direct asset-plus-checksum install for Windows, which is new
+/// download, verification and replacement machinery on the platform where this
+/// binary is least able to overwrite itself while running. Until that exists,
+/// a fork on Windows updates the way it was installed.
+///
+/// `windows` is a parameter rather than `cfg!(windows)` read inside, so the
+/// rule is exercised from any host. A policy that can only be tested on the
+/// platform it governs is a policy tested nowhere until CI happens to run
+/// there.
+fn update_source_unsupported_on_windows(
+    fork_source: Option<&str>,
+    windows: bool,
+) -> Option<String> {
+    if !windows {
+        return None;
+    }
+    let source = fork_source.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(format!(
+        "{FORK_UPDATE_SOURCE_ENV} is set to {source}, but the Windows update path installs through upstream's install script rather than the asset a manifest names, so the notes would come from {source} and the binary from upstream. Update this build the way it was installed, or unset {FORK_UPDATE_SOURCE_ENV}"
+    ))
+}
+
+fn resolve_manifest_url(published: &str, channel: &str, fork_source: Option<&str>) -> String {
+    if crate::build_info::is_published_channel(channel) {
+        return published.to_string();
+    }
+    match fork_source
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+    {
+        Some(source) => source.to_string(),
+        None => published.to_string(),
+    }
+}
+
 fn fetch_update_manifest() -> Result<UpdateManifest, String> {
-    fetch_json_manifest(STABLE_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(&manifest_url(STABLE_UPDATE_MANIFEST_URL))
 }
 
 fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
-    fetch_json_manifest(PREVIEW_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(&manifest_url(PREVIEW_UPDATE_MANIFEST_URL))
 }
 
 fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
@@ -299,6 +743,11 @@ where
     let output = crate::noninteractive_process::curl_command()
         .args([
             "-sfL",
+            // A source refused unless it is `https://` would otherwise reach
+            // plain http one redirect later, and the checksum it names would
+            // verify whatever answered.
+            "--proto-redir",
+            "=https",
             "--retry",
             "3",
             "--connect-timeout",
@@ -341,17 +790,20 @@ fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>
 }
 
 fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
-    let current = Version::current();
-    let latest = Version::parse(&manifest.version)
+    let declared = manifest.version.trim_start_matches('v');
+    let running = crate::build_info::version();
+    let current = BuildIdentity::parse(&running)
+        .ok_or_else(|| format!("invalid running build identity: {running}"))?;
+    let latest = BuildIdentity::parse(declared)
         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
 
-    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
+    if !manifest_release_should_install(&latest, &current, crate::build_info::is_preview()) {
         return Ok(None); // up to date
     }
 
     let metadata = manifest
-        .metadata_for_version(&latest)
-        .ok_or_else(|| format!("missing release metadata for v{latest}"))?;
+        .metadata_for_release(declared)
+        .ok_or_else(|| format!("missing release metadata for {declared}"))?;
     let notes_body = metadata.notes_body();
     if notes_body.is_empty() {
         return Err("update manifest notes are empty".into());
@@ -373,8 +825,8 @@ fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<Releas
         })?;
 
     Ok(Some(ReleaseInfo {
-        identity: latest.to_string(),
-        version: latest,
+        identity: declared.to_string(),
+        version: latest.version,
         channel: UpdateChannel::Stable,
         build_id: None,
         commit: None,
@@ -392,6 +844,37 @@ fn stable_channel_should_install(
     installed_is_preview: bool,
 ) -> bool {
     installed_is_preview || latest > current
+}
+
+/// Whether the release a stable-shaped manifest declares supersedes this build.
+///
+/// A bare `Version` cannot answer this once both sides name the same channel:
+/// it carries major/minor/patch only, so every build a fork publishes at its
+/// pinned base version compares equal to the one already running and reports
+/// "already up to date". That is the same channel-blind comparison
+/// `unpublished_channel_update_refusal` overrides, met again on the way back
+/// in - so the escape hatch that refusal names has to be measured with the
+/// full identity or it can never deliver anything.
+///
+/// Published manifests declare plain `X.Y.Z` releases and so always take the
+/// second arm, which is the original rule unchanged: only a manifest that
+/// declares the running build's own channel reaches the first.
+fn manifest_release_should_install(
+    latest: &BuildIdentity,
+    current: &BuildIdentity,
+    installed_is_preview: bool,
+) -> bool {
+    match (&latest.pre, &current.pre) {
+        (Some((latest_channel, _)), Some((current_channel, _)))
+            if latest_channel == current_channel =>
+        {
+            // Same channel on both sides: this manifest describes builds of the
+            // kind that is running, so its own build-id order decides. An
+            // unorderable pair is not an update.
+            latest.is_newer_than(current).unwrap_or(false)
+        }
+        _ => stable_channel_should_install(&latest.version, &current.version, installed_is_preview),
+    }
 }
 
 fn preview_display_version(base_version: &str, build_id: &str) -> String {
@@ -473,15 +956,22 @@ fn release_info_from_preview_manifest(
 
 /// Check the hosted update manifest for the latest release. Returns release info if newer.
 fn check_latest() -> Result<Option<ReleaseInfo>, String> {
-    let channel = UpdateChannel::configured();
-    if channel == UpdateChannel::Preview {
+    // Before either fetch. Refusing afterwards would spend a network round
+    // trip to learn something knowable from the running binary alone, and
+    // would report the fork's own absence from the manifest as if the manifest
+    // were at fault.
+    if let Some(message) = current_update_refusal() {
+        return Err(message);
+    }
+
+    if fetches_preview_manifest(crate::build_info::channel(), UpdateChannel::configured()) {
         return release_info_from_preview_manifest(&fetch_preview_manifest()?);
     }
 
     let manifest = fetch_update_manifest()?;
     let release = release_info_from_manifest(&manifest)?;
     if let Some(release) = &release {
-        if let Some(metadata) = manifest.metadata_for_version(&release.version) {
+        if let Some(metadata) = manifest.metadata_for_release(&release.identity) {
             handle_manifest_announcement(
                 &release.version.to_string(),
                 metadata.announcement.as_ref(),
@@ -1740,12 +2230,36 @@ fn print_running_session_update_outcomes(
 // Installation manager detection
 // ---------------------------------------------------------------------------
 
+/// Whether advice to update through the install manager applies to this build.
+///
+/// Manager detection answers where the binary lives; this answers what every
+/// piece of manager advice is really asserting - that the manager's package
+/// describes THIS build. On a channel no published release carries, it does
+/// not, and `brew update && brew upgrade herdr` is then the very replacement
+/// the update refusals exist to prevent, reached through advice instead of a
+/// fetch. Asked here so each site that emits such advice consults the rule
+/// rather than deciding it again.
+fn manager_update_advice_applies(channel: &str) -> bool {
+    crate::build_info::is_published_channel(channel)
+}
+
 pub(crate) fn update_install_command() -> &'static str {
-    if is_homebrew_managed_install() {
+    let Ok(current_exe) = env::current_exe() else {
+        return HERDR_UPDATE_COMMAND;
+    };
+
+    update_install_command_for_exe_path(&current_exe, crate::build_info::channel())
+}
+
+fn update_install_command_for_exe_path(path: &Path, channel: &str) -> &'static str {
+    if !manager_update_advice_applies(channel) {
+        return HERDR_UPDATE_COMMAND;
+    }
+    if is_homebrew_managed_exe_path_following_links(path) {
         HOMEBREW_UPDATE_COMMAND
-    } else if is_mise_managed_install() {
+    } else if is_mise_managed_exe_path_following_links(path) {
         MISE_UPDATE_COMMAND
-    } else if is_nix_managed_install() {
+    } else if is_nix_store_exe_path_following_links(path) {
         NIX_UPDATE_COMMAND
     } else {
         HERDR_UPDATE_COMMAND
@@ -1800,23 +2314,43 @@ pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static
         return None;
     };
 
-    preview_channel_rejection_for_exe_path(&current_exe)
+    preview_channel_rejection_for_exe_path(&current_exe, crate::build_info::channel())
 }
 
 pub(crate) fn package_manager_channel_update_guidance_for_current_install() -> Option<&'static str>
 {
-    if is_homebrew_managed_install() {
+    let current_exe = env::current_exe().ok()?;
+
+    package_manager_channel_update_guidance_for_exe_path(&current_exe, crate::build_info::channel())
+}
+
+/// The guidance `herdr channel set` prints instead of updating.
+///
+/// It returns before `self_update` is ever called, so a build this cannot
+/// speak for has to fall through to the refusal there rather than be answered
+/// with the manager's upgrade command.
+fn package_manager_channel_update_guidance_for_exe_path(
+    path: &Path,
+    channel: &str,
+) -> Option<&'static str> {
+    if !manager_update_advice_applies(channel) {
+        return None;
+    }
+    if is_homebrew_managed_exe_path_following_links(path) {
         Some("Use `brew update && brew upgrade herdr` to update Homebrew installs.")
-    } else if is_mise_managed_install() {
+    } else if is_mise_managed_exe_path_following_links(path) {
         Some("Use `mise upgrade herdr` to update mise installs.")
-    } else if is_nix_managed_install() {
+    } else if is_nix_store_exe_path_following_links(path) {
         Some("Update through Nix to update Nix-managed Herdr installs.")
     } else {
         None
     }
 }
 
-fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
+fn preview_channel_rejection_for_exe_path(path: &Path, channel: &str) -> Option<&'static str> {
+    if !manager_update_advice_applies(channel) {
+        return None;
+    }
     if is_homebrew_managed_exe_path_following_links(path) {
         Some(
             "preview channel is only available for direct Herdr installs; Homebrew installs update through `brew update && brew upgrade herdr`",
@@ -1966,6 +2500,15 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    // Above the install-manager dispatch, not inside `check_latest`. Every
+    // branch below this point either resolves an upstream release or tells the
+    // operator to run a package manager that would install one, and both are
+    // wrong for a build that either named its own source or is on a channel no
+    // published manifest describes.
+    if let Some(message) = current_update_refusal() {
+        return Err(message);
+    }
+
     let channel = UpdateChannel::configured();
     #[cfg(windows)]
     if channel == UpdateChannel::Stable {
@@ -2011,7 +2554,15 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         return Err("run `herdr update` outside herdr after detaching from the session".into());
     }
 
-    eprintln!("checking {} channel for updates...", channel.as_str());
+    match fork_update_source() {
+        // The configured channel selects between the published manifests, and
+        // this build fetches neither; naming it here would describe a route
+        // `check_latest` does not take.
+        Some(source) if !crate::build_info::is_published_channel(crate::build_info::channel()) => {
+            eprintln!("checking {source} for updates...");
+        }
+        _ => eprintln!("checking {} channel for updates...", channel.as_str()),
+    }
 
     let current = Version::current();
 
@@ -2123,6 +2674,16 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
         return;
     }
 
+    // Before the install-manager dispatch. The Homebrew branch below returns
+    // without ever calling `check_latest`, and `check_homebrew_latest` compares
+    // with `Version::current()` - the same channel-blind comparison the
+    // refusal exists to override - so a refusal placed only at the fetch would
+    // leave this path offering an upstream release.
+    if let Some(message) = current_update_refusal() {
+        crate::logging::update_check_failed(&message);
+        return;
+    }
+
     let configured_channel = UpdateChannel::configured();
     if is_homebrew_managed_install() {
         if configured_channel == UpdateChannel::Preview {
@@ -2214,7 +2775,9 @@ fn homebrew_release_notes_body_from_manifest(
     version: &Version,
     manifest: Option<&UpdateManifest>,
 ) -> String {
-    if let Some(metadata) = manifest.and_then(|manifest| manifest.metadata_for_version(version)) {
+    if let Some(metadata) =
+        manifest.and_then(|manifest| manifest.metadata_for_release(&version.to_string()))
+    {
         let notes_body = metadata.notes_body();
         if !notes_body.is_empty() {
             handle_manifest_announcement(&version.to_string(), metadata.announcement.as_ref());
@@ -2257,6 +2820,132 @@ fn platform_target() -> (&'static str, &'static str) {
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[test]
+    fn successive_preview_builds_are_ordered() {
+        // The case BASE_VERSION-only comparison could not see: same release,
+        // same channel, one build apart.
+        let a = BuildIdentity::parse("0.8.0-preview.123").expect("parses");
+        let b = BuildIdentity::parse("0.8.0-preview.124").expect("parses");
+        assert_eq!(b.is_newer_than(&a), Some(true), ".124 is newer than .123");
+        assert_eq!(a.is_newer_than(&b), Some(false));
+        assert_ne!(a, b, "successive previews must not compare equal");
+    }
+
+    /// THE SHAPE THIS PROJECT ACTUALLY PUBLISHES.
+    ///
+    /// `preview.yml` builds `build_id="$day-$short_sha"`, so a real identity is
+    /// `0.8.0-preview.2026-06-02-abcdef123456`. A parser expecting a bare
+    /// number swallows that whole tail into the CHANNEL, and two successive
+    /// previews then read as two different channels - incomparable, so a newer
+    /// preview never surfaces its notes. Numeric fixtures alone would never
+    /// have caught it.
+    #[test]
+    fn real_dated_preview_identities_are_ordered() {
+        let older = BuildIdentity::parse("0.8.0-preview.2026-06-02-abcdef123456").expect("parses");
+        let newer = BuildIdentity::parse("0.8.0-preview.2026-06-09-fedcba654321").expect("parses");
+        assert_eq!(
+            older.pre,
+            Some((
+                "preview".to_string(),
+                BuildOrder::Dated {
+                    date: "2026-06-02".to_string(),
+                    sha: "abcdef123456".to_string(),
+                }
+            )),
+            "the channel is `preview`; the date and sha are the build id"
+        );
+        assert_eq!(newer.is_newer_than(&older), Some(true));
+        assert_eq!(older.is_newer_than(&newer), Some(false));
+    }
+
+    /// Two builds on ONE day from different commits carry nothing that says
+    /// which came first. Ordering them by sha would invent a release order out
+    /// of hexadecimal.
+    #[test]
+    fn same_day_different_commit_has_no_order() {
+        let a = BuildIdentity::parse("0.8.0-preview.2026-06-02-aaaaaaaaaaaa").expect("parses");
+        let b = BuildIdentity::parse("0.8.0-preview.2026-06-02-bbbbbbbbbbbb").expect("parses");
+        assert_eq!(a.is_newer_than(&b), None);
+        assert_eq!(b.is_newer_than(&a), None);
+        // ...but a build is not newer than itself.
+        assert_eq!(a.is_newer_than(&a.clone()), Some(false));
+    }
+
+    /// A dated id and a numeric one are different schemes. Comparing them would
+    /// be comparing a date against a counter.
+    #[test]
+    fn mixed_build_id_schemes_have_no_order() {
+        let dated = BuildIdentity::parse("0.8.0-preview.2026-06-02-abcdef123456").expect("parses");
+        let numeric = BuildIdentity::parse("0.8.0-preview.7").expect("parses");
+        assert_eq!(dated.is_newer_than(&numeric), None);
+        assert_eq!(numeric.is_newer_than(&dated), None);
+    }
+
+    #[test]
+    fn a_release_outranks_any_prerelease_of_the_same_version() {
+        let release = BuildIdentity::parse("0.8.0").expect("parses");
+        let pre = BuildIdentity::parse("0.8.0-preview.999").expect("parses");
+        assert_eq!(release.is_newer_than(&pre), Some(true));
+        assert_eq!(pre.is_newer_than(&release), Some(false));
+    }
+
+    #[test]
+    fn a_higher_release_outranks_a_lower_prerelease_and_release() {
+        let next = BuildIdentity::parse("0.8.1").expect("parses");
+        let older_pre = BuildIdentity::parse("0.8.0-preview.999").expect("parses");
+        let older = BuildIdentity::parse("0.8.0").expect("parses");
+        assert_eq!(next.is_newer_than(&older_pre), Some(true));
+        assert_eq!(next.is_newer_than(&older), Some(true));
+    }
+
+    #[test]
+    fn build_identity_parses_every_shape_build_info_emits() {
+        let stable = BuildIdentity::parse("0.8.0").expect("stable");
+        assert!(stable.pre.is_none());
+        let no_id = BuildIdentity::parse("0.8.0-heb").expect("channel without build id");
+        assert_eq!(no_id.pre, Some(("heb".to_string(), BuildOrder::Numeric(0))));
+        let with_id = BuildIdentity::parse("0.8.0-heb.1").expect("channel with build id");
+        assert_eq!(
+            with_id.pre,
+            Some(("heb".to_string(), BuildOrder::Numeric(1)))
+        );
+        // A non-numeric trailing segment belongs to the channel name, not the
+        // build number.
+        let opaque = BuildIdentity::parse("0.8.0-rc.candidate").expect("opaque build id");
+        assert_eq!(
+            opaque.pre,
+            Some((
+                "rc".to_string(),
+                BuildOrder::Opaque("candidate".to_string())
+            ))
+        );
+        assert!(BuildIdentity::parse("not-a-version").is_none());
+        assert!(BuildIdentity::parse("0.8.0-").is_none());
+    }
+
+    #[test]
+    fn the_fork_identity_orders_against_its_own_base() {
+        let base = BuildIdentity::parse("0.8.0").expect("parses");
+        let fork = BuildIdentity::parse("0.8.0-heb.1").expect("parses");
+        assert_eq!(
+            fork.is_newer_than(&base),
+            Some(false),
+            "a fork build is a prerelease of its base version"
+        );
+        let fork2 = BuildIdentity::parse("0.8.0-heb.2").expect("parses");
+        assert_eq!(fork2.is_newer_than(&fork), Some(true));
+
+        // Different channels at one release have NO order, and the type says
+        // so rather than inventing one from the alphabet.
+        let preview = BuildIdentity::parse("0.8.0-preview.7").expect("parses");
+        assert_eq!(
+            fork.is_newer_than(&preview),
+            None,
+            "cross-channel is not comparable"
+        );
+        assert_eq!(preview.is_newer_than(&fork), None);
+    }
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::sync::{
@@ -2528,13 +3217,13 @@ mod tests {
         let nix = Path::new("/nix/store/abc123-herdr-0.6.6/bin/herdr");
         let direct = Path::new("/home/user/.local/bin/herdr");
 
-        assert!(preview_channel_rejection_for_exe_path(homebrew)
+        assert!(preview_channel_rejection_for_exe_path(homebrew, "stable")
             .is_some_and(|message| message.contains("Homebrew")));
-        assert!(preview_channel_rejection_for_exe_path(mise)
+        assert!(preview_channel_rejection_for_exe_path(mise, "stable")
             .is_some_and(|message| message.contains("mise")));
-        assert!(preview_channel_rejection_for_exe_path(nix)
+        assert!(preview_channel_rejection_for_exe_path(nix, "stable")
             .is_some_and(|message| message.contains("Nix")));
-        assert!(preview_channel_rejection_for_exe_path(direct).is_none());
+        assert!(preview_channel_rejection_for_exe_path(direct, "stable").is_none());
     }
 
     #[test]
@@ -3213,7 +3902,7 @@ mod tests {
         assert_eq!(manifest.assets.len(), 2);
         assert_eq!(
             manifest
-                .metadata_for_version(&Version::parse("0.2.0").unwrap())
+                .metadata_for_release("0.2.0")
                 .expect("metadata")
                 .notes_body(),
             "### Changed\n- One"
@@ -3254,7 +3943,9 @@ mod tests {
         }"####;
         let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
         let version = Version::parse("0.2.0").unwrap();
-        let metadata = manifest.metadata_for_version(&version).expect("metadata");
+        let metadata = manifest
+            .metadata_for_release(&version.to_string())
+            .expect("metadata");
 
         assert_eq!(metadata.notes_body(), "### Changed\n- Two");
         assert_eq!(
@@ -3294,7 +3985,9 @@ mod tests {
         }"####;
         let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
         let version = Version::parse("0.3.0").unwrap();
-        let metadata = manifest.metadata_for_version(&version).expect("metadata");
+        let metadata = manifest
+            .metadata_for_release(&version.to_string())
+            .expect("metadata");
 
         assert_eq!(metadata.notes_body(), "### Changed\n- Root");
         assert_eq!(
@@ -3323,7 +4016,7 @@ mod tests {
         assert!(manifest.releases.is_empty());
         assert_eq!(
             manifest
-                .metadata_for_version(&Version::parse("0.3.0").unwrap())
+                .metadata_for_release("0.3.0")
                 .expect("metadata")
                 .notes_body(),
             "### Changed\n- Root"
@@ -3393,6 +4086,649 @@ mod tests {
 
         assert_eq!(release.version, Version::parse("99.99.99").unwrap());
         assert_eq!(release.download_url, "https://example.com/herdr");
+    }
+
+    /// The two channels that publish a manifest update normally.
+    #[test]
+    fn published_channels_resolve_updates_from_their_manifest() {
+        assert_eq!(
+            unpublished_channel_update_refusal("stable", None, None, false),
+            None
+        );
+        assert_eq!(
+            unpublished_channel_update_refusal("preview", None, None, false),
+            None
+        );
+        assert_eq!(
+            unpublished_channel_update_refusal("stable", None, Some("Homebrew"), false),
+            None
+        );
+    }
+
+    /// The defect: a fork build offered an upstream release.
+    ///
+    /// `Version::current()` discards the channel suffix, so `0.8.0-heb.1`
+    /// compares as `0.8.0` and upstream `0.8.1` reads as strictly newer. The
+    /// refusal has to come from the channel, because the version comparison
+    /// cannot see the problem.
+    #[test]
+    fn an_unpublished_channel_refuses_to_update_from_a_published_manifest() {
+        let message = unpublished_channel_update_refusal("heb", None, None, false)
+            .expect("an unpublished channel must refuse to self-update");
+        assert!(
+            message.contains("heb"),
+            "the message must name the channel: {message}"
+        );
+        assert!(
+            message.contains(FORK_UPDATE_SOURCE_ENV),
+            "the message must name the way out: {message}"
+        );
+
+        // The version comparison this refusal exists to override: without it,
+        // a newer upstream release is judged installable on a fork build.
+        let fork_as_the_comparison_sees_it =
+            Version::parse(crate::build_info::BASE_VERSION).expect("base version parses");
+        let upstream = Version::parse("0.8.1").expect("parses");
+        assert!(
+            stable_channel_should_install(&upstream, &fork_as_the_comparison_sees_it, false),
+            "this asserts the hazard is real; if it ever stops holding, the \
+             refusal is still correct but this test no longer explains why"
+        );
+    }
+
+    /// This fork stamps an unpublished channel, so the refusal is the path
+    /// every build on this branch actually takes.
+    #[test]
+    fn this_fork_refuses_to_self_update() {
+        assert!(
+            unpublished_channel_update_refusal(crate::build_info::channel(), None, None, false)
+                .is_some(),
+            "channel {:?} would self-update from a published manifest",
+            crate::build_info::channel()
+        );
+    }
+
+    /// The escape hatch must point at what was configured.
+    ///
+    /// Allowing the refusal to lift while still fetching `herdr.dev` would be
+    /// the same leak behind a flag - and a worse one, because the operator
+    /// asked for their own source and would silently receive upstream's.
+    #[test]
+    fn a_configured_fork_source_is_used_instead_of_upstream() {
+        assert_eq!(
+            unpublished_channel_update_refusal(
+                "heb",
+                Some("https://example.invalid/fork.json"),
+                None,
+                false
+            ),
+            None,
+            "an explicitly configured source must lift the refusal"
+        );
+        assert_eq!(
+            unpublished_channel_update_refusal("heb", Some("   "), None, false),
+            unpublished_channel_update_refusal("heb", None, None, false),
+            "a blank source is not a configured source"
+        );
+        // Unset: the published URL is used unchanged.
+        assert_eq!(
+            manifest_url(STABLE_UPDATE_MANIFEST_URL),
+            STABLE_UPDATE_MANIFEST_URL,
+            "with no configured source the published manifest must be used"
+        );
+    }
+
+    /// The override redirects the fetch only where something is refused.
+    ///
+    /// On a published channel nothing is refused, so a redirect buys no
+    /// capability and instead lets the environment choose the manifest that
+    /// names both the download URL and the SHA-256 it is checked against -
+    /// which is the whole of what an update verifies.
+    #[test]
+    fn a_published_channel_ignores_a_configured_update_source() {
+        let hostile = "https://attacker.invalid/latest.json";
+        for channel in ["stable", "preview"] {
+            assert_eq!(
+                resolve_manifest_url(STABLE_UPDATE_MANIFEST_URL, channel, Some(hostile)),
+                STABLE_UPDATE_MANIFEST_URL,
+                "the {channel} channel must not fetch its manifest from {hostile}"
+            );
+            assert_eq!(
+                resolve_manifest_url(PREVIEW_UPDATE_MANIFEST_URL, channel, Some(hostile)),
+                PREVIEW_UPDATE_MANIFEST_URL,
+            );
+        }
+    }
+
+    /// The channel that is refused is the one the override exists for.
+    #[test]
+    fn an_unpublished_channel_fetches_the_configured_source() {
+        let fork = "https://example.invalid/fork.json";
+        assert_eq!(
+            resolve_manifest_url(STABLE_UPDATE_MANIFEST_URL, "heb", Some(fork)),
+            fork,
+            "a configured source must replace the upstream URL, not merely unlock it"
+        );
+        assert_eq!(
+            resolve_manifest_url(STABLE_UPDATE_MANIFEST_URL, "heb", Some("   ")),
+            STABLE_UPDATE_MANIFEST_URL,
+            "a blank source is not a configured source"
+        );
+        assert_eq!(
+            resolve_manifest_url(STABLE_UPDATE_MANIFEST_URL, "heb", None),
+            STABLE_UPDATE_MANIFEST_URL,
+        );
+    }
+
+    /// The published path decides exactly as it did before identities were
+    /// compared: manifests declare plain `X.Y.Z`, which never takes the
+    /// same-channel arm.
+    #[test]
+    fn a_published_release_is_judged_by_its_version_alone() {
+        let newer = BuildIdentity::parse("0.8.1").expect("parses");
+        let same = BuildIdentity::parse("0.8.0").expect("parses");
+        let running = BuildIdentity::parse("0.8.0").expect("parses");
+
+        assert!(manifest_release_should_install(&newer, &running, false));
+        assert!(!manifest_release_should_install(&same, &running, false));
+
+        // A preview build on the stable channel takes the stable release even
+        // at the same base version, which is how it returns to stable.
+        let preview = BuildIdentity::parse("0.8.0-preview.7").expect("parses");
+        assert!(manifest_release_should_install(&same, &preview, true));
+        assert!(!manifest_release_should_install(&same, &preview, false));
+    }
+
+    /// A published channel ignores the override, and must say so.
+    ///
+    /// Ignoring it is correct - the manifest names the asset URL AND the
+    /// SHA-256 it is verified against, so an environment-chosen manifest
+    /// verifies whatever it likes. Ignoring it in silence is not: the operator
+    /// named a source and received upstream's with nothing said.
+    #[test]
+    fn a_published_channel_rejects_an_update_source_out_loud() {
+        for channel in ["stable", "preview"] {
+            let message = published_channel_rejects_update_source(
+                channel,
+                Some("https://example.invalid/fork.json"),
+            )
+            .unwrap_or_else(|| panic!("{channel} must refuse a configured source"));
+            assert!(
+                message.contains(FORK_UPDATE_SOURCE_ENV) && message.contains(channel),
+                "the refusal must name the setting and the channel: {message}"
+            );
+            // The silent path this replaces: the URL really is discarded.
+            assert_eq!(
+                resolve_manifest_url(
+                    STABLE_UPDATE_MANIFEST_URL,
+                    channel,
+                    Some("https://example.invalid/fork.json")
+                ),
+                STABLE_UPDATE_MANIFEST_URL,
+                "if this ever starts honouring the override, the refusal above \
+                 is wrong rather than merely redundant"
+            );
+        }
+        // Nothing configured: nothing to reject.
+        assert_eq!(
+            published_channel_rejects_update_source("stable", None),
+            None
+        );
+        assert_eq!(
+            published_channel_rejects_update_source("stable", Some("  ")),
+            None
+        );
+        // An unpublished channel is where the override is honoured.
+        assert_eq!(
+            published_channel_rejects_update_source("heb", Some("https://example.invalid/f.json")),
+            None
+        );
+    }
+
+    /// Windows discards the manifest's asset, so a source cannot be honoured.
+    ///
+    /// `install_windows_update_with_installer` runs upstream's install script
+    /// and passes it a channel and a build id; the `download_url` and
+    /// `sha256` the manifest supplied never reach it. A configured source
+    /// would therefore choose the notes while upstream chose the binary.
+    ///
+    /// The platform is a parameter, so this runs from any host. A policy
+    /// testable only on the platform it governs is tested nowhere until CI
+    /// happens to go there - which is precisely how the Windows path kept its
+    /// gap while every other route was closed.
+    #[test]
+    fn windows_refuses_a_configured_update_source() {
+        let source = Some("https://example.invalid/fork.json");
+        let message = update_source_unsupported_on_windows(source, true)
+            .expect("windows must refuse a configured source");
+        assert!(
+            message.contains(FORK_UPDATE_SOURCE_ENV),
+            "the refusal must name the setting: {message}"
+        );
+
+        // Elsewhere the source is honoured; this refusal is Windows-only.
+        assert_eq!(update_source_unsupported_on_windows(source, false), None);
+        // Nothing configured is nothing to refuse, on either platform.
+        assert_eq!(update_source_unsupported_on_windows(None, true), None);
+        assert_eq!(update_source_unsupported_on_windows(Some("  "), true), None);
+    }
+
+    /// On Windows the refusal wins over advice that cannot be followed there.
+    ///
+    /// The manager conflict answers "install this build directly to update it
+    /// from your source", and the unpublished-channel refusal answers "set
+    /// HERDR_UPDATE_SOURCE". Neither is achievable on Windows, and the second
+    /// would loop an operator straight back into the refusal they just hit.
+    #[test]
+    fn windows_advice_never_points_at_a_route_windows_refuses() {
+        let source = Some("https://example.invalid/fork.json");
+        let windows = update_refusal("heb", source, Some("Homebrew"), true)
+            .expect("a configured source on windows must refuse");
+        assert!(
+            !windows.contains("Install this build directly"),
+            "windows cannot honour a source through a direct install either: {windows}"
+        );
+
+        // With nothing configured, the remedy must not name the variable that
+        // this platform refuses.
+        let unconfigured = update_refusal("heb", None, None, true)
+            .expect("an unpublished channel must still refuse");
+        assert!(
+            !unconfigured.contains(FORK_UPDATE_SOURCE_ENV),
+            "windows advice must not send the operator to a setting it refuses: {unconfigured}"
+        );
+        // Off Windows that route is real and must still be offered.
+        let elsewhere = update_refusal("heb", None, None, false)
+            .expect("an unpublished channel must still refuse");
+        assert!(
+            elsewhere.contains(FORK_UPDATE_SOURCE_ENV),
+            "off windows the source route is the way out: {elsewhere}"
+        );
+    }
+
+    /// The half a refusal at the fetch cannot reach.
+    ///
+    /// With a source configured the fork refusal lifts, and the Homebrew
+    /// branch returns before `check_latest` is ever called - offering
+    /// `brew upgrade herdr`, which installs upstream's formula while the notes
+    /// came from the configured manifest.
+    #[test]
+    fn a_configured_source_refuses_to_go_through_an_install_manager() {
+        let source = Some("https://example.invalid/fork.json");
+        for channel in ["stable", "preview", "heb"] {
+            for manager in ["Homebrew", "mise", "Nix"] {
+                let message = update_source_conflicts_with_manager(channel, source, Some(manager))
+                    .unwrap_or_else(|| panic!("{manager} must conflict with a configured source"));
+                assert!(
+                    message.contains(manager) && message.contains(FORK_UPDATE_SOURCE_ENV),
+                    "the refusal must name the manager and the setting: {message}"
+                );
+            }
+        }
+        // A direct install is exactly where a configured source is delivered,
+        // through the manifest's own asset and checksum.
+        assert_eq!(
+            update_source_conflicts_with_manager("heb", source, None),
+            None
+        );
+        // No source configured: the manager's normal advice still applies.
+        assert_eq!(
+            update_source_conflicts_with_manager("stable", None, Some("Homebrew")),
+            None
+        );
+        assert_eq!(
+            update_source_conflicts_with_manager("stable", Some("   "), Some("Homebrew")),
+            None
+        );
+    }
+
+    /// No refusal may hand back the advice it is refusing.
+    ///
+    /// Both messages end in a remedy, and on a channel no published release
+    /// carries, "update it through Homebrew" is the replacement being refused,
+    /// performed by hand. `update_source_conflicts_with_manager` is reachable
+    /// only on such a channel - `update_refusal` answers the published case
+    /// before it - so its remedy is the one an operator actually reads.
+    #[test]
+    fn an_unpublished_channel_is_never_told_to_update_through_its_manager() {
+        for manager in ["Homebrew", "mise", "Nix"] {
+            let through_the_manager = format!("update it through {manager}");
+            let configured = update_source_conflicts_with_manager(
+                "heb",
+                Some("https://example.invalid/fork.json"),
+                Some(manager),
+            )
+            .expect("a configured source conflicts with a manager");
+            let unconfigured =
+                unpublished_channel_update_refusal("heb", None, Some(manager), false)
+                    .expect("an unpublished channel refuses to self-update");
+
+            for message in [&configured, &unconfigured] {
+                assert!(
+                    !message.contains(&through_the_manager),
+                    "a build {manager} does not describe must not be sent to it: {message}"
+                );
+                assert!(
+                    message.contains(manager) && message.contains("replace this build"),
+                    "the operator has to be told what {manager} would do instead: {message}"
+                );
+            }
+        }
+
+        // A published channel keeps the remedy, because there the manager's
+        // package really does describe this build. It is a defensive default
+        // for a direct caller rather than a sentence an operator reads:
+        // `update_refusal` answers the published case before this function
+        // runs, which `every_dispatch_refuses_the_same_cases` pins.
+        let source = Some("https://example.invalid/fork.json");
+        let published = update_source_conflicts_with_manager("stable", source, Some("Homebrew"))
+            .expect("a configured source conflicts with a manager");
+        assert!(
+            published.contains("update it through Homebrew"),
+            "a stable build may be told to unset the source and use its manager: {published}"
+        );
+        assert_ne!(
+            update_refusal("stable", source, Some("Homebrew"), false),
+            Some(published),
+            "the published remedy must stay unreachable through the composed policy"
+        );
+    }
+
+    /// The same loop the Windows refusal closed, on a manager-owned install.
+    ///
+    /// Setting the variable is refused for any build a manager owns, so
+    /// advising it there would send the operator to a refusal and back. The
+    /// remedy - install this build directly - is the one that leads somewhere,
+    /// and it is where the variable becomes usable.
+    #[test]
+    fn a_manager_owned_build_is_not_sent_to_a_setting_it_refuses() {
+        for manager in ["Homebrew", "mise", "Nix"] {
+            let managed = unpublished_channel_update_refusal("heb", None, Some(manager), false)
+                .expect("an unpublished channel must refuse to self-update");
+            assert!(
+                !managed.contains(FORK_UPDATE_SOURCE_ENV),
+                "{manager} refuses a configured source, so it must not be advised: {managed}"
+            );
+            assert!(
+                managed.contains("install a new build of it directly"),
+                "the remedy that does lead somewhere must remain: {managed}"
+            );
+            // The refusal the withdrawn advice would have walked into.
+            assert!(update_refusal(
+                "heb",
+                Some("https://example.invalid/fork.json"),
+                Some(manager),
+                false
+            )
+            .is_some_and(|message| message.contains(manager)));
+        }
+
+        // A direct install is where the route is real, so it must keep it.
+        let direct = unpublished_channel_update_refusal("heb", None, None, false)
+            .expect("an unpublished channel must refuse to self-update");
+        assert!(
+            direct.contains(FORK_UPDATE_SOURCE_ENV),
+            "a direct install can honour a configured source: {direct}"
+        );
+    }
+
+    /// The same rule, at the boundaries that answer before any refusal runs.
+    ///
+    /// `herdr channel set` prints this guidance and returns without ever
+    /// calling `self_update`, and the update-ready notice carries an install
+    /// command the operator is expected to run - so a build the manager's
+    /// package does not describe has to fall through to the refusal instead of
+    /// being handed the manager's upgrade command.
+    #[test]
+    fn manager_advice_is_withheld_from_a_build_no_manifest_describes() {
+        let homebrew = Path::new("/opt/homebrew/Cellar/herdr/0.6.6/bin/herdr");
+        let mise = Path::new("/home/user/.local/share/mise/installs/herdr/0.6.6/bin/herdr");
+        let nix = Path::new("/nix/store/abc123-herdr-0.6.6/bin/herdr");
+
+        for path in [homebrew, mise, nix] {
+            assert!(
+                package_manager_channel_update_guidance_for_exe_path(path, "stable").is_some(),
+                "a stable build is updated through its manager"
+            );
+            assert_eq!(
+                package_manager_channel_update_guidance_for_exe_path(path, "heb"),
+                None,
+                "`herdr channel set` must fall through to the update refusal for {}",
+                path.display()
+            );
+            assert_ne!(
+                update_install_command_for_exe_path(path, "stable"),
+                HERDR_UPDATE_COMMAND
+            );
+            assert_eq!(
+                update_install_command_for_exe_path(path, "heb"),
+                HERDR_UPDATE_COMMAND,
+                "the update notice must not prescribe an upstream package for {}",
+                path.display()
+            );
+            assert_eq!(
+                preview_channel_rejection_for_exe_path(path, "heb"),
+                None,
+                "the channel rejection speaks for manager-managed published builds only"
+            );
+        }
+    }
+
+    /// A source that names the manifest must not name a transport that lets
+    /// anyone else name it instead.
+    ///
+    /// The manifest carries the asset URL AND the SHA-256 it is verified
+    /// against, so a manifest fetched over plain http is a binary chosen by
+    /// whoever is on the path, with the checksum confirming their own bytes.
+    #[test]
+    fn a_configured_update_source_must_be_https() {
+        for hostile in [
+            "http://example.invalid/fork.json",
+            "file:///tmp/fork.json",
+            "ftp://example.invalid/fork.json",
+            "example.invalid/fork.json",
+            "-o/tmp/pwned",
+            "https://",
+        ] {
+            let message = unusable_update_source_refusal(Some(hostile))
+                .unwrap_or_else(|| panic!("{hostile} is not a usable update source"));
+            assert!(
+                message.contains(FORK_UPDATE_SOURCE_ENV) && message.contains(HTTPS_SCHEME),
+                "the refusal must name the setting and what it requires: {message}"
+            );
+            assert_eq!(
+                update_refusal("heb", Some(hostile), None, false),
+                Some(message),
+                "the refusal has to reach the dispatch, not just exist"
+            );
+        }
+
+        assert_eq!(
+            unusable_update_source_refusal(Some("https://example.invalid/fork.json")),
+            None
+        );
+        assert_eq!(unusable_update_source_refusal(Some("   ")), None);
+        assert_eq!(unusable_update_source_refusal(None), None);
+    }
+
+    /// What each dispatch point refuses, decided once.
+    ///
+    /// The fetch, the manual update and the background check all ask this, so
+    /// the table is the whole policy rather than one caller's view of it.
+    #[test]
+    fn every_dispatch_refuses_the_same_cases() {
+        let source = Some("https://example.invalid/fork.json");
+
+        // A stock build with nothing configured updates normally, manager or
+        // not; a refusal here would strand every ordinary install.
+        assert_eq!(update_refusal("stable", None, None, false), None);
+        assert_eq!(
+            update_refusal("stable", None, Some("Homebrew"), false),
+            None
+        );
+        assert_eq!(update_refusal("preview", None, None, false), None);
+
+        // Set on a published channel: refused rather than discarded silently.
+        assert!(update_refusal("stable", source, None, false)
+            .is_some_and(|message| message.contains("stable")));
+        // ...and the published refusal is what is said, not the manager one.
+        assert_eq!(
+            update_refusal("stable", source, Some("Homebrew"), false),
+            published_channel_rejects_update_source("stable", source)
+        );
+
+        // The fork: refused with nothing configured, delivered with a source,
+        // refused again when the binary belongs to a manager.
+        assert!(update_refusal("heb", None, None, false).is_some());
+        assert_eq!(update_refusal("heb", source, None, false), None);
+        assert_eq!(
+            update_refusal("heb", source, Some("mise"), false),
+            update_source_conflicts_with_manager("heb", source, Some("mise"))
+        );
+        assert_eq!(
+            update_refusal("heb", Some("  "), None, false),
+            update_refusal("heb", None, None, false),
+            "a blank source configures nothing"
+        );
+    }
+
+    /// The configured channel selects between the two published manifests, and
+    /// a build that fetches neither must not be routed by it.
+    ///
+    /// `manifest_url` sends both fetches to the configured source, so on an
+    /// unpublished channel the preview route would hand that source - which
+    /// declares the build's own channel - to the preview parser, which accepts
+    /// only `"preview"`. The escape hatch failed as a JSON parse error for
+    /// anyone who had ever run `herdr channel set preview`.
+    #[test]
+    fn an_unpublished_channel_is_not_routed_by_the_configured_channel() {
+        assert!(fetches_preview_manifest("stable", UpdateChannel::Preview));
+        assert!(fetches_preview_manifest("preview", UpdateChannel::Preview));
+        assert!(!fetches_preview_manifest("stable", UpdateChannel::Stable));
+
+        for configured in [UpdateChannel::Stable, UpdateChannel::Preview] {
+            assert!(
+                !fetches_preview_manifest("heb", configured),
+                "the {} setting must not choose the manifest shape for a build \
+                 whose source describes its own channel",
+                configured.as_str()
+            );
+        }
+
+        // The failure that routing produced: the fork's own manifest names its
+        // own channel, and the preview parser refuses anything else.
+        let fork_manifest = r#"{"channel":"heb","build_id":"2","base_version":"0.8.0","commit":"abc","built_at":"now","protocol":20,"notes":"one change","assets":{}}"#;
+        let parsed: PreviewManifest =
+            serde_json::from_str(fork_manifest).expect("the fork manifest deserialises");
+        assert!(
+            release_info_from_preview_manifest(&parsed).is_err(),
+            "the preview route cannot deliver a manifest for another channel"
+        );
+    }
+
+    /// The escape hatch has to be able to deliver something.
+    ///
+    /// The refusal names `HERDR_UPDATE_SOURCE` as the way out, but the path
+    /// behind it compared bare versions: a fork pinned to its base version
+    /// publishes `0.8.0-heb.2` against a running `0.8.0-heb.1`, both read as
+    /// `0.8.0`, and the only route out of the refusal reported "already up to
+    /// date" for every build the fork will ever publish.
+    #[test]
+    fn a_fork_source_can_deliver_a_build_at_the_same_base_version() {
+        let running = BuildIdentity::parse("0.8.0-heb.1").expect("parses");
+        let next = BuildIdentity::parse("0.8.0-heb.2").expect("parses");
+        let same = BuildIdentity::parse("0.8.0-heb.1").expect("parses");
+        let older = BuildIdentity::parse("0.8.0-heb.0").expect("parses");
+
+        assert!(
+            manifest_release_should_install(&next, &running, false),
+            "a newer build on this build's own channel must be installable"
+        );
+        assert!(!manifest_release_should_install(&same, &running, false));
+        assert!(!manifest_release_should_install(&older, &running, false));
+
+        // The bare comparison is what could not see it.
+        assert!(!stable_channel_should_install(
+            &next.version,
+            &running.version,
+            false
+        ));
+    }
+
+    /// The same thing through the real manifest path, against the identity
+    /// this binary actually reports.
+    #[test]
+    fn a_fork_manifest_resolves_a_release_for_this_build() {
+        let running = crate::build_info::version();
+        let current = BuildIdentity::parse(&running).expect("the running identity parses");
+        let (channel, order) = current.pre.clone().expect("this fork stamps a channel");
+        let BuildOrder::Numeric(build_id) = order else {
+            panic!("this fork's build id is a counter; got {running}");
+        };
+        let declared = format!(
+            "{}-{}.{}",
+            crate::build_info::BASE_VERSION,
+            channel,
+            build_id + 1
+        );
+
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let json = format!(
+            r####"{{
+                "version": "{declared}",
+                "protocol": 20,
+                "notes": "### Fixed\n- A fork build",
+                "assets": {{
+                    "{asset_key}": {{
+                        "url": "https://example.invalid/herdr",
+                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }}
+                }}
+            }}"####
+        );
+        let manifest: UpdateManifest = serde_json::from_str(&json).expect("manifest parses");
+
+        let release = release_info_from_manifest(&manifest)
+            .expect("a fork manifest must resolve")
+            .expect("a newer fork build is an available release");
+
+        assert_eq!(
+            release.label(),
+            declared,
+            "the release must be labelled with the full identity, not the bare version"
+        );
+        assert_eq!(release.download_url, "https://example.invalid/herdr");
+        assert_eq!(release.notes_body, "### Fixed\n- A fork build");
+    }
+
+    /// The manifest the fork already runs is not an update.
+    #[test]
+    fn a_fork_manifest_declaring_the_running_build_is_up_to_date() {
+        let declared = crate::build_info::version();
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let json = format!(
+            r####"{{
+                "version": "{declared}",
+                "protocol": 20,
+                "notes": "### Fixed\n- Already running",
+                "assets": {{
+                    "{asset_key}": {{
+                        "url": "https://example.invalid/herdr",
+                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }}
+                }}
+            }}"####
+        );
+        let manifest: UpdateManifest = serde_json::from_str(&json).expect("manifest parses");
+
+        assert!(
+            release_info_from_manifest(&manifest)
+                .expect("a fork manifest must resolve")
+                .is_none(),
+            "the running build must not be offered to itself"
+        );
     }
 
     #[test]
@@ -3474,7 +4810,7 @@ mod tests {
             serde_json::from_str(json).expect("website/latest.json should match updater schema");
 
         assert!(!manifest
-            .metadata_for_version(&Version::parse(&manifest.version).unwrap())
+            .metadata_for_release(manifest.version.trim_start_matches('v'))
             .expect("metadata")
             .notes_body()
             .is_empty());

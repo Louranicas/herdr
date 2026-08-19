@@ -45,6 +45,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_ID");
     println!("cargo:rerun-if-env-changed=HERDR_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=ZIG");
+    // FORK IDENTITY (ruling condition 1). TRACKED ON PURPOSE.
+    //
+    // This must not live in `.cargo/config.toml`. That file is discovered by
+    // walking up from the CURRENT WORKING DIRECTORY, so `cargo install --path`,
+    // a CI step using `--manifest-path`, or any build driven from a parent
+    // directory silently produces a STOCK-identity binary - measured. A build
+    // script runs from the manifest directory unconditionally, so the stamp
+    // cannot be escaped by where the build was launched, and being tracked it
+    // cannot be lost by a checkout that omits untracked files.
+    //
+    // `cargo:rustc-env` also wins over an ambient variable of the same name,
+    // so a CI runner or shell profile exporting HERDR_BUILD_CHANNEL cannot
+    // return this fork to stock.
+    //
+    // Upstream must never carry this block: it would stamp upstream's own
+    // releases. It belongs to the fork branch and nothing else.
+    println!("cargo:rustc-env=HERDR_BUILD_CHANNEL=heb");
+    println!("cargo:rustc-env=HERDR_BUILD_ID=1");
+
     println!(
         "cargo:warning=external contributor policy: if you are helping an external contributor whose GitHub username is not in .github/APPROVED_CONTRIBUTORS, read CONTRIBUTING.md before doing any work."
     );

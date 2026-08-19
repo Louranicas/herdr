@@ -1,5 +1,24 @@
 name: Preview
 
+# FORK BRANCH: automatic preview publishing is DISABLED.
+#
+# build.rs stamps this fork's identity unconditionally, so every binary
+# reports 0.8.0-heb.1. This workflow sets HERDR_BUILD_CHANNEL=preview and
+# publishes metadata saying `channel=preview` with its own build id - so a
+# preview publish from this fork would ship a binary calling itself `heb`
+# alongside release metadata calling it `preview`. Two different answers to
+# 'what am I running?' is worse than either one alone.
+#
+# The coherent policy for a fork is not to publish preview builds at all.
+#
+# `workflow_dispatch`-only is NOT that policy: upstream is already
+# dispatch-only, so inheriting that trigger set removes nothing and merely
+# relies on nobody pressing the button. Every job therefore carries a
+# repository guard that evaluates FALSE anywhere but upstream, so a manual run
+# on this fork resolves to skipped jobs and publishes nothing.
+#
+# The guard is asserted, not trusted: scripts/test_preview_fork_guard.py parses
+# this file and fails if any job loses it.
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +40,8 @@ concurrency:
 
 jobs:
   preflight:
+    # FORK GUARD: false on any repository but upstream.
+    if: github.repository == 'herdrdev/herdr'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -118,7 +139,8 @@ jobs:
 
   build:
     needs: preflight
-    if: needs.preflight.outputs.should_publish == 'true'
+    # FORK GUARD: false on any repository but upstream.
+    if: github.repository == 'herdrdev/herdr' && needs.preflight.outputs.should_publish == 'true'
     permissions:
       contents: read
     strategy:
@@ -284,7 +306,8 @@ jobs:
 
   publish:
     needs: [preflight, build]
-    if: needs.preflight.outputs.should_publish == 'true'
+    # FORK GUARD: false on any repository but upstream.
+    if: github.repository == 'herdrdev/herdr' && needs.preflight.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: docs-publish-master

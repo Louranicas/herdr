@@ -91,6 +91,7 @@ mod render_prof;
 mod render_signal;
 mod selection;
 mod server;
+mod server_epoch;
 mod session;
 mod sound;
 mod terminal;
@@ -487,6 +488,36 @@ where
         .collect()
 }
 
+/// Mint the server-incarnation token, or refuse to become a server.
+///
+/// Fatal on purpose, and ONLY on the server paths: a server that cannot mint
+/// an unguessable incarnation token would have to serve either a fabricated
+/// one or none, and both defeat the staleness check the token exists for.
+/// Client paths never call this — they have no incarnation to identify and
+/// must keep working against an already-valid server.
+pub(crate) fn mint_server_epoch_or_exit() {
+    refuse_to_serve_without_epoch(server_epoch::init());
+}
+
+/// What a server does with a refusal, separated from producing one so the
+/// consequence - stop, do not serve - is exercised rather than assumed.
+fn refuse_to_serve_without_epoch(minted: Result<(), server_epoch::EntropyUnavailable>) {
+    if let Err(err) = minted {
+        // BOTH channels, deliberately. The daemon launch path spawns the
+        // server with stderr redirected to /dev/null, so `eprintln!` alone
+        // reaches nobody: a user running plain `herdr` would see a silent wait
+        // and then a generic "the background server may still be starting",
+        // pointing at a log containing nothing. A server that cannot say why
+        // it stopped is the thing this refusal exists to avoid.
+        tracing::error!("{err}");
+        eprintln!("error: {err}");
+        // EX_UNAVAILABLE: a required service - the OS entropy source - is not
+        // available. Not EX_SOFTWARE, which would blame the program for an
+        // environment failure.
+        std::process::exit(69);
+    }
+}
+
 fn main() -> io::Result<()> {
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
@@ -548,6 +579,11 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
+        // The token is minted inside `run_server`, immediately after logging
+        // starts. Minting HERE would run before `init_logging`, and this path
+        // is spawned by the daemon launcher with stderr redirected to
+        // /dev/null - so a refusal would reach neither the terminal nor the
+        // log, and the user would see only a silent wait.
         return server::headless::run_server();
     }
 
@@ -788,6 +824,10 @@ fn main() -> io::Result<()> {
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub = api::EventHub::default();
+    // Same boundary as the headless path: this process is about to expose the
+    // API socket, so it needs an incarnation token before any response can be
+    // served. Idempotent — a second call does not re-mint.
+    mint_server_epoch_or_exit();
     let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
@@ -954,6 +994,50 @@ mod tests {
         assert_eq!(
             args_as_utf8(args).unwrap(),
             ["herdr", "pane", "get", "pane-1"]
+        );
+    }
+
+    /// Set in the child of the test below; nothing in production reads it.
+    const REFUSAL_CHILD: &str = "HERDR_TEST_ENTROPY_REFUSAL_CHILD";
+
+    /// A server that cannot mint an epoch must DIE, with a code that blames the
+    /// environment and a stderr line saying why.
+    ///
+    /// The refusal is a process-level contract - an exit status and a
+    /// message - so it is asserted on a real process: this test re-executes
+    /// the test binary, which runs this same function again, takes the branch
+    /// below with an entropy source that is unavailable, and ends the way a
+    /// server on a machine without entropy would. Without this, "exit 69" is
+    /// a line of code nobody has ever run.
+    #[test]
+    fn a_server_that_cannot_mint_an_epoch_exits_69_and_says_why() {
+        const NAME: &str = "tests::a_server_that_cannot_mint_an_epoch_exits_69_and_says_why";
+
+        if std::env::var_os(REFUSAL_CHILD).is_some() {
+            refuse_to_serve_without_epoch(server_epoch::init_without_entropy_for_test());
+            // Only reachable if the refusal returned instead of exiting, which
+            // is the regression this test exists to catch: a server that keeps
+            // going without an incarnation token.
+            eprintln!("refusal returned instead of exiting");
+            std::process::exit(0);
+        }
+
+        let binary = std::env::current_exe().expect("the test binary must be re-runnable");
+        let output = std::process::Command::new(binary)
+            .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+            .env(REFUSAL_CHILD, "1")
+            .output()
+            .expect("re-run the test binary");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(69),
+            "EX_UNAVAILABLE blames the environment, not herdr; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("OS entropy unavailable"),
+            "the refusal must tell the user what stopped the server: {stderr}"
         );
     }
 

@@ -4791,6 +4791,13 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
 /// Run the headless server. This is the entry point called from main.rs.
 pub fn run_server() -> io::Result<()> {
     init_logging();
+    // AFTER logging, BEFORE any `api::start_server`. The incarnation token
+    // belongs to the server process boundary - minting it at the top of main
+    // made every client-only path (help, status, completion, update) draw
+    // entropy and able to exit while talking to a perfectly good server, a
+    // failure invented by the diagnostic rather than found by it. Minting
+    // before logging was the opposite mistake: the refusal had nowhere to go.
+    crate::mint_server_epoch_or_exit();
     crate::platform::raise_server_nofile_limit();
 
     let args: Vec<String> = std::env::args().collect();

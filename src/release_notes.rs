@@ -71,6 +71,11 @@ fn load_stored_from_path(path: &Path) -> Option<StoredReleaseNotes> {
 }
 
 pub fn load_latest() -> Option<ReleaseNotes> {
+    // The FULL build identity, not BASE_VERSION. Comparing on the base alone
+    // made every non-stable identity equal, so successive preview builds
+    // (0.8.0-preview.123 -> .124) could never show newer notes. Comparing on
+    // the display string with `Version::parse` was the opposite failure: it
+    // parses to None and disables the check entirely.
     load_latest_from_path(&pending_path(), &crate::build_info::version())
 }
 
@@ -89,10 +94,17 @@ fn release_notes_from_stored(
     }
 
     let preview = match (
-        crate::update::Version::parse(&stored.version),
-        crate::update::Version::parse(current_version),
+        crate::update::BuildIdentity::parse(&stored.version),
+        crate::update::BuildIdentity::parse(current_version),
     ) {
-        (Some(stored_version), Some(current_version)) => stored_version > current_version,
+        // `None` means the two identities are not comparable - different
+        // channels at the same release. Not comparable is not "newer".
+        (Some(stored_identity), Some(current_identity)) => stored_identity
+            .is_newer_than(&current_identity)
+            .unwrap_or(false),
+        // An unparseable identity on either side is not evidence of newer
+        // notes. Refusing here keeps a malformed version from presenting
+        // stale notes as an update.
         _ => false,
     };
 
@@ -172,6 +184,102 @@ pub fn normalize_body(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The caller, not the comparator. `BuildIdentity` ordering can be correct
+    /// while `release_notes` still hands it the wrong strings — comparing on
+    /// BASE_VERSION did exactly that, and every comparator test passed.
+    #[test]
+    fn a_newer_preview_build_is_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.124".to_string(),
+            body: "### Changed\n- newer preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes = super::release_notes_from_stored(stored, "0.8.0-preview.123")
+            .expect("newer notes must be reported");
+        assert!(
+            notes.preview,
+            "0.8.0-preview.124 is newer than the running .123 and must read as preview"
+        );
+    }
+
+    /// The caller, in the shape this project actually publishes.
+    ///
+    /// The numeric fixture above passes on a parser that cannot read a real
+    /// preview id at all. `preview.yml` emits `<date>-<sha>`, so this is the
+    /// case that decides whether a real preview build ever shows its notes.
+    #[test]
+    fn a_newer_real_dated_preview_is_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.2026-06-09-fedcba654321".to_string(),
+            body: "### Changed\n- newer dated preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes =
+            super::release_notes_from_stored(stored, "0.8.0-preview.2026-06-02-abcdef123456")
+                .expect("newer notes must be reported");
+        assert!(
+            notes.preview,
+            "a preview built later must read as an available update"
+        );
+    }
+
+    #[test]
+    fn an_older_real_dated_preview_is_not_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.2026-05-30-aaaaaaaaaaaa".to_string(),
+            body: "### Changed\n- older dated preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes =
+            super::release_notes_from_stored(stored, "0.8.0-preview.2026-06-02-abcdef123456")
+                .expect("notes are still returned");
+        assert!(!notes.preview, "an earlier build is not an update");
+    }
+
+    #[test]
+    fn an_older_preview_build_is_not_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.122".to_string(),
+            body: "### Changed\n- older preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes = super::release_notes_from_stored(stored, "0.8.0-preview.123")
+            .expect("notes are still returned");
+        assert!(!notes.preview, "an older build is not an update");
+    }
+
+    /// Cross-channel at one release is NOT comparable, and not-comparable is
+    /// not "newer". Ordering these by channel name would have made the answer
+    /// depend on the alphabet.
+    #[test]
+    fn a_different_channel_at_the_same_release_is_not_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.999".to_string(),
+            body: "### Changed\n- other channel".to_string(),
+            show_on_startup: true,
+        };
+        let notes = super::release_notes_from_stored(stored, "0.8.0-heb.1")
+            .expect("notes are still returned");
+        assert!(
+            !notes.preview,
+            "no order across channels means no update claim"
+        );
+    }
+
+    /// The regression that motivated the change: a stable release is newer
+    /// than any pre-release of the same version.
+    #[test]
+    fn a_stable_release_outranks_the_running_prerelease() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0".to_string(),
+            body: "### Changed\n- stable".to_string(),
+            show_on_startup: true,
+        };
+        let notes =
+            super::release_notes_from_stored(stored, "0.8.0-heb.1").expect("notes are returned");
+        assert!(notes.preview, "0.8.0 is newer than 0.8.0-heb.1");
+    }
     use super::*;
 
     #[test]

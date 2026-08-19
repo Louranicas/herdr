@@ -124,6 +124,16 @@ Call `session.snapshot` again after reconnecting or when the local cache may be
 stale. Attached worktree provenance is included on workspace records. Full repo
 worktree discovery remains `worktree.list`.
 
+The response also carries `server_epoch`, a token identifying the server
+incarnation that answered. It is minted in memory once per server process and
+is never written anywhere, so a saved snapshot cannot carry a value matching the
+current process. A client that recorded the token and later sees a different one
+knows the server restarted or handed off and its cache is stale; a client
+holding only a snapshot cannot manufacture one. The field is absent — not empty
+— when unavailable, so absence must never be read as "the empty epoch". The same
+field appears on agent records, because the staleness case it detects is exactly
+the one where an agent may already be gone.
+
 From the CLI, `herdr api snapshot` prints the live `session.snapshot` response
 as JSON for clients and agents that want a simple bootstrap command.
 

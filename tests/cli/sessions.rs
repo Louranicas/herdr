@@ -384,10 +384,20 @@ fn status_commands_report_client_and_server_versions() {
     );
     let full_stdout = String::from_utf8_lossy(&full.stdout);
     assert!(full_stdout.contains("client:\n"), "stdout: {full_stdout}");
+    // Not CARGO_PKG_VERSION: `status` prints build_info::version(), which is
+    // the package version ONLY on the stable channel. Recomposed from the same
+    // compile-time inputs rather than probed from a second process - both
+    // processes are this crate's own binary, so probing compares a constant
+    // with itself.
     assert!(
-        full_stdout.contains(&format!("  version: {}", env!("CARGO_PKG_VERSION"))),
+        full_stdout.contains(&format!("  version: {}", expected_version())),
         "stdout: {full_stdout}"
     );
+    assert!(
+        expected_version().starts_with(env!("CARGO_PKG_VERSION")),
+        "the reported identity must still be rooted in the package version"
+    );
+
     assert!(
         full_stdout.contains("  protocol: 20"),
         "stdout: {full_stdout}"
@@ -418,7 +428,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))),
+        server_stdout.contains(&format!("version: {}", expected_version())),
         "stdout: {server_stdout}"
     );
     assert!(
@@ -430,7 +440,7 @@ fn status_commands_report_client_and_server_versions() {
     assert!(client.status.success());
     let client_stdout = String::from_utf8_lossy(&client.stdout);
     assert!(
-        client_stdout.contains(&format!("version: {}", env!("CARGO_PKG_VERSION"))),
+        client_stdout.contains(&format!("version: {}", expected_version())),
         "stdout: {client_stdout}"
     );
     assert!(
@@ -443,7 +453,12 @@ fn status_commands_report_client_and_server_versions() {
     );
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
-    assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(full_json["client"]["version"], expected_version());
+    assert_eq!(
+        full_json["client"]["version"],
+        concat!(env!("CARGO_PKG_VERSION"), "-heb.1"),
+        "status must report the fork identity"
+    );
     assert_eq!(full_json["client"]["protocol"], 20);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
@@ -457,12 +472,17 @@ fn status_commands_report_client_and_server_versions() {
 
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
-    assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(server_json["version"], expected_version());
+    assert_eq!(
+        server_json["version"],
+        concat!(env!("CARGO_PKG_VERSION"), "-heb.1"),
+        "the server must report the fork identity"
+    );
     assert_eq!(server_json["protocol"], 20);
     assert_eq!(server_json["compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
-    assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(client_json["version"], expected_version());
     assert_eq!(client_json["protocol"], 20);
     assert!(client_json["binary"]
         .as_str()

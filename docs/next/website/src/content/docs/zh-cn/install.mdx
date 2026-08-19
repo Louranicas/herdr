@@ -136,6 +136,12 @@ herdr channel set stable
 
 预览构建是从当前开发分支手动发布的 GitHub 预发布。当你想在下一个稳定版之前拿到修复时很有用,但它们可能出现回归。Homebrew、mise 和 Nix 安装不使用预览通道。
 
+在任何已发布发行清单都未描述的通道上构建的二进制文件(分叉,或标记了自定义通道的本地构建)无法从已发布的清单解析更新,因为从未有发布版本携带该通道。`herdr update` 会在获取任何内容之前拒绝,而不是用无关的上游二进制文件替换该构建。在 Linux 与 macOS 的直接安装上,请将 `HERDR_UPDATE_SOURCE` 设为该构建自身通道的清单 URL 以改从它更新,或按安装这个构建时的方式装入新构建。不要走 Homebrew、mise 或 Nix,它们的 `herdr` 包是上游的。该变量仅对这类构建生效,且必须是 `https://` URL。在 stable 与 preview 上,只要设置了该变量,`herdr update` 会拒绝而不是悄悄忽略它:清单同时指定要安装的二进制文件和用于校验它的校验和,因此采纳由环境选定的清单,等于让环境挑选替换 Herdr 的二进制文件。要从已发布的清单更新,请取消设置该变量。Homebrew、mise 和 Nix 安装同样会被拒绝,因为它们通过包管理器更新而不是就地更新。在 Windows 上也会被拒绝:Windows 的更新路径通过 Herdr 的安装脚本安装,而不是清单指定的资产,因此在那里采纳该变量,会让发行说明来自你指定的来源、而二进制文件来自上游;这类构建请按安装它时的方式更新。配置的更新通道只在已发布的清单之间做选择,所以从 `HERDR_UPDATE_SOURCE` 更新的构建,无论设置哪个通道都从该来源获取。
+
+```bash
+HERDR_UPDATE_SOURCE=https://example.com/my-fork.json herdr update
+```
+
 Windows 测试版构建目前仅限预览通道。在稳定的 Windows 发布可用之前,Windows 上的 `herdr channel set stable` 会被拒绝。
 
 默认情况下,`herdr update` 安装新二进制文件,并不打扰兼容的运行中会话。如果某次更新改变了 Herdr 的客户端/服务器协议,Herdr 会在安装后询问是否停止旧服务器。要使用新版本,请停止旧服务器。停止会退出窗格进程。对于默认会话,运行 `herdr server stop`,再运行 `herdr`。对于命名会话,运行 `herdr session stop <name>`,再运行 `herdr session attach <name>`。

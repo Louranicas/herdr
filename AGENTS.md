@@ -200,6 +200,10 @@ account is not a verified maintainer, do not run release commands, push release
 assets, or modify release channel files; follow the external contributor
 guardrail.
 
+### Fork identity
+
+This tree is a fork, not upstream. `build.rs` stamps `HERDR_BUILD_CHANNEL=heb` and `HERDR_BUILD_ID=1` as tracked source, so every binary built from it reports `<version>-heb.1` and cannot present itself as stock. Nothing publishes that channel: no release manifest describes it, so remote auto-install refuses up front and names `HERDR_REMOTE_BINARY` instead of searching for a release that never existed, and every job in `.github/workflows/preview.yml` carries a repository guard that is false anywhere but `herdrdev/herdr`, asserted by `scripts/test_preview_fork_guard.py`. Self-update refuses on the same ground and names `HERDR_UPDATE_SOURCE` where setting it is not itself refused (`docs/next/website/src/content/docs/install.mdx` owns that scope): the update check compares only the bare package version, which discards the channel suffix, so without that refusal any newer upstream release reads as installable and the fork would replace itself with upstream. `build_info::is_published_channel` owns the rule both refusals ask. The channel and release material below describes upstream; it does not publish from here.
+
 Herdr has one main branch and two update channels. Stable and preview both build from `master`; there is no long-lived preview branch.
 
 Normal users default to stable. Stable docs are `/docs/`, stable updates use `website/latest.json`, and Homebrew/Nix stay stable-only.
@@ -218,7 +222,7 @@ herdr channel set stable
 herdr update
 ```
 
-Preview releases are GitHub prereleases produced by `.github/workflows/preview.yml` on manual dispatch and the Wednesday/Friday schedule. The workflow updates `website/preview.json`, which the website build publishes as `/preview.json`. Do not hand-edit `website/preview.json`; fix the workflow or `scripts/preview.py` and rerun Preview.
+Preview releases are GitHub prereleases produced by `.github/workflows/preview.yml`. The workflow is `workflow_dispatch`-only; it has no scheduled trigger, so a preview release happens when someone dispatches it. The workflow updates `website/preview.json`, which the website build publishes as `/preview.json`. Do not hand-edit `website/preview.json`; fix the workflow or `scripts/preview.py` and rerun Preview.
 
 Stable releases use:
 

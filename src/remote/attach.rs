@@ -1498,7 +1498,31 @@ fn preview_assets_for_build<'a>(
     Ok((build.protocol, &build.assets))
 }
 
+/// Why no published manifest can describe a build on `channel`, when that is
+/// the case.
+///
+/// Auto-install resolves the remote binary by looking the LOCAL identity up in
+/// a published manifest, and only two manifests exist: the stable release
+/// manifest and the preview manifest. A build stamped with any other channel -
+/// this fork, or a local `HERDR_BUILD_CHANNEL` - appears in neither. Falling
+/// through to the stable lookup reports that as "release manifest does not
+/// include herdr 0.8.0-heb.1", which reads as a gap in the manifest rather
+/// than as a build that was never published, and only after a pointless
+/// network fetch. The override is what such a build needs, so the error names
+/// it.
+fn unpublished_channel_error(channel: &str) -> Option<String> {
+    if crate::build_info::is_published_channel(channel) {
+        return None;
+    }
+    Some(format!(
+        "this herdr is built on the `{channel}` channel, which no published release manifest describes, so the remote binary cannot be resolved automatically; set {REMOTE_BINARY_ENV_VAR}=target/release/herdr or install a matching herdr on the remote host manually"
+    ))
+}
+
 fn remote_release_asset(asset_key: &str) -> io::Result<RemoteReleaseAsset> {
+    if let Some(message) = unpublished_channel_error(current_channel()) {
+        return Err(io::Error::other(message));
+    }
     if crate::build_info::is_preview() {
         let build_id = crate::build_info::build_id().ok_or_else(|| {
             io::Error::other("preview client has no build id; set HERDR_REMOTE_BINARY or install Herdr on the remote manually")
@@ -3275,6 +3299,38 @@ mod tests {
         assert_eq!(
             install_source_description_for(&platform, None, true),
             "the current local herdr binary"
+        );
+    }
+
+    /// The two channels that publish a manifest resolve normally; anything
+    /// else must say so instead of searching the stable manifest for a version
+    /// that was never released.
+    #[test]
+    fn only_published_channels_can_be_resolved_from_a_manifest() {
+        assert_eq!(unpublished_channel_error("stable"), None);
+        assert_eq!(unpublished_channel_error("preview"), None);
+
+        let message = unpublished_channel_error("heb").expect("an unpublished channel must refuse");
+        assert!(
+            message.contains("heb"),
+            "the message must name the channel: {message}"
+        );
+        assert!(
+            message.contains(REMOTE_BINARY_ENV_VAR),
+            "the message must name the way out: {message}"
+        );
+    }
+
+    /// This fork stamps `heb` unconditionally, so the refusal above is the
+    /// path every build on this branch actually takes - not a hypothetical
+    /// channel that no binary reports.
+    #[test]
+    fn this_fork_is_an_unpublished_channel() {
+        assert!(
+            unpublished_channel_error(current_channel()).is_some(),
+            "channel {:?} resolves from a manifest; if this fork ever becomes \
+             publishable, revisit the refusal rather than deleting it",
+            current_channel()
         );
     }
 

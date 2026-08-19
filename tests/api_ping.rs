@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
+    cleanup_test_base, expected_version, register_runtime_dir, register_spawned_herdr_pid,
     unregister_spawned_herdr_pid,
 };
 
@@ -301,9 +301,24 @@ fn ping_over_socket_returns_version() {
     );
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
-    assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
-    // Intentionally hardcoded so wire protocol bumps require updating this test.
-    // Changing this value means old clients/servers are no longer compatible.
+    // Pinning CARGO_PKG_VERSION here asserted that the running build is STOCK.
+    // That is false for any non-stable channel: build_info::version() composes
+    // "{version}-{channel}.{build_id}", so a fork build - or an upstream
+    // preview build - serves a different string by design. Recomposed from the
+    // same compile-time inputs, so the check stays exact either way.
+    assert_eq!(value["result"]["version"], expected_version());
+    // Exact, not merely self-consistent: a recomposition that happened to
+    // produce the stock string would still match itself.
+    assert_eq!(
+        value["result"]["version"],
+        concat!(env!("CARGO_PKG_VERSION"), "-heb.1"),
+        "ping must serve the fork identity"
+    );
+    assert!(
+        expected_version().starts_with(env!("CARGO_PKG_VERSION")),
+        "the served identity must still be rooted in the package version"
+    );
+
     assert_eq!(value["result"]["protocol"], 20);
 
     cleanup_spawned_herdr(child, base);
