@@ -89,38 +89,101 @@ impl Version {
     }
 }
 
-/// A full build identity: a release version plus, for a non-stable channel, the
-/// channel and its build number — exactly what `build_info::version()` emits.
+/// How a channel's build ids are ordered.
 ///
-/// `Version` alone cannot order these. It carries major/minor/patch only, so
-/// `0.8.0-preview.123` and `0.8.0-preview.124` are indistinguishable to it, and
-/// both fail its three-part parse outright. Comparing release notes on
-/// `BASE_VERSION` sidesteps that by making every non-stable identity equal —
-/// which stops newer preview notes being recognised at all, trading one silent
-/// failure for another.
+/// The real preview id is `<YYYY-MM-DD>-<12 hex>` - `build_id="$day-$short_sha"`
+/// in `.github/workflows/preview.yml` - producing identities like
+/// `0.8.0-preview.2026-06-02-abcdef123456`. An earlier revision here assumed a
+/// bare number, failed to parse that, and swallowed the whole tail into the
+/// CHANNEL name; two successive previews then looked like two different
+/// channels and compared as not-comparable. The parser has to know the shape
+/// the project actually emits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildOrder {
+    /// A plain counter, e.g. the fork's own `heb.1`.
+    Numeric(u64),
+    /// `YYYY-MM-DD-<sha>`. ISO dates sort lexicographically as they sort
+    /// chronologically, which is the only reason comparing them as strings is
+    /// sound.
+    Dated { date: String, sha: String },
+    /// Anything else. Equal to itself and ordered against nothing, rather than
+    /// silently ranked by whatever the bytes happen to be.
+    Opaque(String),
+}
+
+impl BuildOrder {
+    fn parse(raw: &str) -> Self {
+        if let Ok(n) = raw.parse::<u64>() {
+            return Self::Numeric(n);
+        }
+        // `YYYY-MM-DD-<rest>`: exactly three leading dash-separated fields of
+        // 4/2/2 digits, then the commit.
+        let parts: Vec<&str> = raw.splitn(4, '-').collect();
+        if parts.len() == 4
+            && parts[0].len() == 4
+            && parts[1].len() == 2
+            && parts[2].len() == 2
+            && parts[..3]
+                .iter()
+                .all(|p| p.bytes().all(|b| b.is_ascii_digit()))
+            && !parts[3].is_empty()
+        {
+            return Self::Dated {
+                date: format!("{}-{}-{}", parts[0], parts[1], parts[2]),
+                sha: parts[3].to_string(),
+            };
+        }
+        Self::Opaque(raw.to_string())
+    }
+
+    /// `None` where no defensible order exists.
+    fn is_after(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Numeric(a), Self::Numeric(b)) => Some(a > b),
+            (Self::Dated { date: da, sha: sa }, Self::Dated { date: db, sha: sb }) => {
+                if da == db {
+                    // Same day, different commit: nothing here says which came
+                    // first, and guessing would be inventing a release order.
+                    if sa == sb {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(da > db)
+                }
+            }
+            (Self::Opaque(a), Self::Opaque(b)) if a == b => Some(false),
+            // Mixed or unrecognised shapes have no order.
+            _ => None,
+        }
+    }
+}
+
+/// A full build identity: a release version plus, for a non-stable channel, the
+/// channel and its build id - exactly what `build_info::version()` emits.
+///
+/// `Version` alone cannot order these. It carries major/minor/patch only, and
+/// fails its three-part parse on any pre-release at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildIdentity {
     pub version: Version,
     /// `None` on the stable channel. `Some((channel, build))` otherwise.
-    pub pre: Option<(String, u64)>,
+    pub pre: Option<(String, BuildOrder)>,
 }
 
 impl BuildIdentity {
-    /// Accepts `X.Y.Z`, `X.Y.Z-channel`, and `X.Y.Z-channel.N`.
+    /// Accepts `X.Y.Z`, `X.Y.Z-channel`, and `X.Y.Z-channel.<build-id>`.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
         let (core, pre) = match s.split_once('-') {
             None => (s, None),
             Some((core, rest)) => {
-                let (channel, build) = match rest.rsplit_once('.') {
-                    // A trailing numeric segment is the build number; anything
-                    // else is part of the channel name, so `-rc.candidate`
-                    // stays one channel rather than becoming build "candidate".
-                    Some((channel, num)) => match num.parse::<u64>() {
-                        Ok(n) => (channel.to_string(), n),
-                        Err(_) => (rest.to_string(), 0),
-                    },
-                    None => (rest.to_string(), 0),
+                // The channel is everything before the FIRST dot; the build id
+                // is the remainder, which may itself contain dashes.
+                let (channel, build) = match rest.split_once('.') {
+                    Some((channel, build)) => (channel.to_string(), BuildOrder::parse(build)),
+                    None => (rest.to_string(), BuildOrder::Numeric(0)),
                 };
                 if channel.is_empty() {
                     return None;
@@ -135,15 +198,6 @@ impl BuildIdentity {
     }
 }
 
-/// Whether `self` is strictly newer than `other`, or `None` when the two are
-/// NOT COMPARABLE.
-///
-/// Cross-channel identities at the same release are the not-comparable case:
-/// "0.8.0-heb.1 versus 0.8.0-preview.7" has no direction anybody can defend.
-/// An earlier revision ordered them by channel NAME, which is a total order
-/// and a fiction - it would have made `heb` reliably "older" than `preview`
-/// for no reason but the alphabet, and a caller asking "is this newer?" would
-/// have received a confident wrong answer instead of an honest refusal.
 impl BuildIdentity {
     pub fn is_newer_than(&self, other: &Self) -> Option<bool> {
         use std::cmp::Ordering;
@@ -159,7 +213,7 @@ impl BuildIdentity {
             (Some(_), None) => Some(false),
             (Some((ac, an)), Some((bc, bn))) => {
                 if ac == bc {
-                    Some(an > bn)
+                    an.is_after(bn)
                 } else {
                     // Different channels, same release: no order.
                     None
@@ -2349,6 +2403,56 @@ mod tests {
         assert_ne!(a, b, "successive previews must not compare equal");
     }
 
+    /// THE SHAPE THIS PROJECT ACTUALLY PUBLISHES.
+    ///
+    /// `preview.yml` builds `build_id="$day-$short_sha"`, so a real identity is
+    /// `0.8.0-preview.2026-06-02-abcdef123456`. A parser expecting a bare
+    /// number swallows that whole tail into the CHANNEL, and two successive
+    /// previews then read as two different channels - incomparable, so a newer
+    /// preview never surfaces its notes. Numeric fixtures alone would never
+    /// have caught it.
+    #[test]
+    fn real_dated_preview_identities_are_ordered() {
+        let older = BuildIdentity::parse("0.8.0-preview.2026-06-02-abcdef123456").expect("parses");
+        let newer = BuildIdentity::parse("0.8.0-preview.2026-06-09-fedcba654321").expect("parses");
+        assert_eq!(
+            older.pre,
+            Some((
+                "preview".to_string(),
+                BuildOrder::Dated {
+                    date: "2026-06-02".to_string(),
+                    sha: "abcdef123456".to_string(),
+                }
+            )),
+            "the channel is `preview`; the date and sha are the build id"
+        );
+        assert_eq!(newer.is_newer_than(&older), Some(true));
+        assert_eq!(older.is_newer_than(&newer), Some(false));
+    }
+
+    /// Two builds on ONE day from different commits carry nothing that says
+    /// which came first. Ordering them by sha would invent a release order out
+    /// of hexadecimal.
+    #[test]
+    fn same_day_different_commit_has_no_order() {
+        let a = BuildIdentity::parse("0.8.0-preview.2026-06-02-aaaaaaaaaaaa").expect("parses");
+        let b = BuildIdentity::parse("0.8.0-preview.2026-06-02-bbbbbbbbbbbb").expect("parses");
+        assert_eq!(a.is_newer_than(&b), None);
+        assert_eq!(b.is_newer_than(&a), None);
+        // ...but a build is not newer than itself.
+        assert_eq!(a.is_newer_than(&a.clone()), Some(false));
+    }
+
+    /// A dated id and a numeric one are different schemes. Comparing them would
+    /// be comparing a date against a counter.
+    #[test]
+    fn mixed_build_id_schemes_have_no_order() {
+        let dated = BuildIdentity::parse("0.8.0-preview.2026-06-02-abcdef123456").expect("parses");
+        let numeric = BuildIdentity::parse("0.8.0-preview.7").expect("parses");
+        assert_eq!(dated.is_newer_than(&numeric), None);
+        assert_eq!(numeric.is_newer_than(&dated), None);
+    }
+
     #[test]
     fn a_release_outranks_any_prerelease_of_the_same_version() {
         let release = BuildIdentity::parse("0.8.0").expect("parses");
@@ -2371,13 +2475,22 @@ mod tests {
         let stable = BuildIdentity::parse("0.8.0").expect("stable");
         assert!(stable.pre.is_none());
         let no_id = BuildIdentity::parse("0.8.0-heb").expect("channel without build id");
-        assert_eq!(no_id.pre, Some(("heb".to_string(), 0)));
+        assert_eq!(no_id.pre, Some(("heb".to_string(), BuildOrder::Numeric(0))));
         let with_id = BuildIdentity::parse("0.8.0-heb.1").expect("channel with build id");
-        assert_eq!(with_id.pre, Some(("heb".to_string(), 1)));
+        assert_eq!(
+            with_id.pre,
+            Some(("heb".to_string(), BuildOrder::Numeric(1)))
+        );
         // A non-numeric trailing segment belongs to the channel name, not the
         // build number.
-        let dotted = BuildIdentity::parse("0.8.0-rc.candidate").expect("dotted channel");
-        assert_eq!(dotted.pre, Some(("rc.candidate".to_string(), 0)));
+        let opaque = BuildIdentity::parse("0.8.0-rc.candidate").expect("opaque build id");
+        assert_eq!(
+            opaque.pre,
+            Some((
+                "rc".to_string(),
+                BuildOrder::Opaque("candidate".to_string())
+            ))
+        );
         assert!(BuildIdentity::parse("not-a-version").is_none());
         assert!(BuildIdentity::parse("0.8.0-").is_none());
     }

@@ -226,6 +226,13 @@ fn the_token_is_identical_on_the_snapshot_and_on_agent_info() {
 
 /// The whole point: a live handoff replaces the process, so the token must
 /// change. A consumer holding the old value can then tell.
+///
+/// Unix only. `server live-handoff` passes the listening socket to the
+/// successor across a UNIX domain socket; there is no equivalent path on
+/// Windows, so the test is not "expected to fail" there - it is not applicable,
+/// and `cfg` says so rather than a runtime skip that still has to compile
+/// against an API that does not exist.
+#[cfg(unix)]
 #[test]
 fn a_successful_handoff_rotates_the_token() {
     let iso = Isolated::start("rotate");
@@ -266,6 +273,7 @@ fn a_successful_handoff_rotates_the_token() {
 
 /// A handoff that FAILS must leave the incarnation alone. Rotating on a failed
 /// handoff would tell every client its cache was stale when nothing moved.
+#[cfg(unix)]
 #[test]
 fn a_failed_handoff_retains_the_token() {
     let iso = Isolated::start("retain");
@@ -442,4 +450,34 @@ fn the_binary_reports_the_fork_identity_on_both_version_flags() {
             "{flag} must print the fork identity exactly, not stock"
         );
     }
+}
+
+/// On Windows the live-handoff path does not exist, so the token must NOT
+/// rotate — and the file must still carry real coverage there rather than
+/// compiling to nothing. This asserts the absence explicitly: a platform where
+/// every meaningful test is `cfg`'d out is a platform with no coverage at all,
+/// which reads identically to a platform where everything passed.
+#[cfg(not(unix))]
+#[test]
+fn the_token_is_stable_where_live_handoff_is_unsupported() {
+    let iso = Isolated::start("nohandoff");
+    let before = iso.snapshot_epoch().expect("token");
+    let out = iso
+        .cmd(&[
+            "server",
+            "live-handoff",
+            "--import-exe",
+            env!("CARGO_BIN_EXE_herdr"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "live handoff is not supported here and must not report success"
+    );
+    let after = iso.snapshot_epoch().expect("token after");
+    assert_eq!(
+        before, after,
+        "nothing was replaced, so the incarnation must not have changed"
+    );
 }

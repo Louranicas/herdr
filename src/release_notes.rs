@@ -203,6 +203,40 @@ mod tests {
         );
     }
 
+    /// The caller, in the shape this project actually publishes.
+    ///
+    /// The numeric fixture above passes on a parser that cannot read a real
+    /// preview id at all. `preview.yml` emits `<date>-<sha>`, so this is the
+    /// case that decides whether a real preview build ever shows its notes.
+    #[test]
+    fn a_newer_real_dated_preview_is_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.2026-06-09-fedcba654321".to_string(),
+            body: "### Changed\n- newer dated preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes =
+            super::release_notes_from_stored(stored, "0.8.0-preview.2026-06-02-abcdef123456")
+                .expect("newer notes must be reported");
+        assert!(
+            notes.preview,
+            "a preview built later must read as an available update"
+        );
+    }
+
+    #[test]
+    fn an_older_real_dated_preview_is_not_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.2026-05-30-aaaaaaaaaaaa".to_string(),
+            body: "### Changed\n- older dated preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes =
+            super::release_notes_from_stored(stored, "0.8.0-preview.2026-06-02-abcdef123456")
+                .expect("notes are still returned");
+        assert!(!notes.preview, "an earlier build is not an update");
+    }
+
     #[test]
     fn an_older_preview_build_is_not_reported_as_preview() {
         let stored = super::StoredReleaseNotes {
