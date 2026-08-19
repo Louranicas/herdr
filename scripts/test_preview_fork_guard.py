@@ -72,9 +72,37 @@ def _strip_comment(line: str) -> str:
     return "".join(out).rstrip()
 
 
-def scan() -> dict:
-    """A deliberately small model: top-level trigger keys, and job -> `if`."""
-    text = WORKFLOW.read_text()
+def _trigger_names_from_inline(value: str) -> list[str]:
+    """Triggers written on the `on:` line itself.
+
+    YAML gives three ways to say the same thing, and an earlier revision of
+    this scanner modelled only the block-mapping one. `on: [push]` and
+    `on: push` were therefore not "unrecognised" - they were INVISIBLE. The
+    trigger list came back empty and the no-automatic-triggers assertion
+    passed because it had nothing to object to. A check that cannot see the
+    thing it forbids is worse than no check: it reports the policy as held.
+    """
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [item.strip().strip("\"'") for item in inner.split(",") if item.strip()]
+    if any(ch in value for ch in "[]{}:,"):
+        raise WorkflowShapeError(
+            f"unmodelled inline trigger syntax on the `on:` line: {value!r}"
+        )
+    return [value.strip("\"'")]
+
+
+def scan(text: str | None = None) -> dict:
+    """A deliberately small model: top-level trigger keys, and job -> `if`.
+
+    `text` exists so the scanner's own blind spots can be tested against
+    workflows this repository does not contain. Asserting only against the
+    committed file tests the scanner exactly where it happens to work.
+    """
+    if text is None:
+        text = WORKFLOW.read_text()
     if "\t" in text:
         raise WorkflowShapeError("tab in the workflow; this scanner models spaces only")
 
@@ -91,15 +119,30 @@ def scan() -> dict:
         body = line.strip()
 
         if indent == 0:
+            key, _, inline = body.partition(":")
+            key = key.strip().strip("\"'")
             # `on:` is the trigger block; `jobs:` opens the job map.
-            section = "on" if body in ("on:", '"on":', "'on':") else (
-                "jobs" if body == "jobs:" else None
-            )
+            section = "on" if key == "on" else ("jobs" if key == "jobs" else None)
             current_job = None
+            if section == "on" and inline.strip():
+                # Written inline, so there is no block to walk into.
+                triggers.extend(_trigger_names_from_inline(inline.strip()))
+                section = None
             continue
 
-        if section == "on" and indent == 2 and body.endswith(":"):
-            triggers.append(body[:-1].strip().strip("\"'"))
+        if section == "on" and indent == 2:
+            if body.startswith("- "):
+                # Block sequence: `on:` then `- push`.
+                triggers.append(body[2:].strip().strip("\"'"))
+            elif ":" in body:
+                # `push:`, `push: {}`, and `push: {branches: [main]}` all name
+                # the same trigger. Requiring a bare trailing colon would let
+                # the configured forms slip past as unrecognised.
+                triggers.append(body.split(":", 1)[0].strip().strip("\"'"))
+            else:
+                raise WorkflowShapeError(
+                    f"unmodelled trigger entry under `on:`: {body!r}"
+                )
         elif section == "jobs" and indent == 2 and body.endswith(":"):
             current_job = body[:-1].strip().strip("\"'")
             jobs[current_job] = None
@@ -122,12 +165,62 @@ class PreviewForkGuard(unittest.TestCase):
 
     def test_no_automatic_triggers(self) -> None:
         """A push or schedule would publish without anyone deciding to."""
-        fired_automatically = {"push", "pull_request", "schedule", "release"}
         present = set(self.doc["triggers"])
+        # Non-vacuity first. An empty trigger set satisfies "contains nothing
+        # automatic" perfectly, so without this the assertion below reports the
+        # policy as held precisely when the scanner has gone blind.
+        self.assertTrue(
+            present,
+            "no triggers were parsed at all; the scanner cannot see this "
+            "workflow's `on:` block, so it cannot be asserting anything about it",
+        )
+        fired_automatically = {"push", "pull_request", "schedule", "release"}
         self.assertFalse(
             present & fired_automatically,
             f"preview publishing must not fire automatically; found {sorted(present & fired_automatically)}",
         )
+
+    def test_an_automatic_trigger_is_caught_however_it_is_written(self) -> None:
+        """Fail-closed, against workflows this repository does not contain.
+
+        Every form below is ordinary YAML that GitHub honours and that the
+        previous scanner returned as NO TRIGGERS - so the no-automatic-triggers
+        assertion passed on a workflow that publishes on every push. That is
+        the exact failure this suite exists to prevent, so each form is fed
+        through the real scanner and required to surface `push`.
+        """
+        jobs_block = "\njobs:\n  publish:\n    if: github.repository == 'herdrdev/herdr'\n"
+        for label, on_block in [
+            ("inline flow sequence", "on: [workflow_dispatch, push]"),
+            ("inline scalar", "on: push"),
+            ("block mapping", "on:\n  workflow_dispatch:\n  push:"),
+            ("block mapping with empty flow map", "on:\n  workflow_dispatch:\n  push: {}"),
+            ("block mapping with filters", "on:\n  push:\n    branches: [master]"),
+            ("block sequence", "on:\n  - workflow_dispatch\n  - push"),
+        ]:
+            with self.subTest(form=label):
+                doc = scan(on_block + jobs_block)
+                self.assertIn(
+                    "push",
+                    doc["triggers"],
+                    f"the {label} form hid an automatic trigger from the scanner",
+                )
+
+    def test_the_configured_workflow_is_still_seen(self) -> None:
+        """The committed file must parse to exactly its one manual trigger.
+
+        Pairs with the fail-closed cases above: those prove the scanner can
+        see `push`, this proves it is not simply reporting triggers that are
+        not there.
+        """
+        self.assertEqual(self.doc["triggers"], ["workflow_dispatch"])
+
+    def test_unmodelled_trigger_syntax_raises_rather_than_scanning_empty(self) -> None:
+        """Refusing beats guessing - and beats silently returning nothing."""
+        with self.assertRaises(WorkflowShapeError):
+            _trigger_names_from_inline("{push: {branches: [main]}}")
+        with self.assertRaises(WorkflowShapeError):
+            scan("on:\n  ???\njobs:\n  publish:\n    if: x\n")
 
     def test_every_job_carries_the_repository_guard(self) -> None:
         """At JOB level, so it governs the whole job rather than one step."""
