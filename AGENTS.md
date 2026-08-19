@@ -200,6 +200,10 @@ account is not a verified maintainer, do not run release commands, push release
 assets, or modify release channel files; follow the external contributor
 guardrail.
 
+### Fork identity
+
+This tree is a fork, not upstream. `build.rs` stamps `HERDR_BUILD_CHANNEL=heb` and `HERDR_BUILD_ID=1` as tracked source, so every binary built from it reports `<version>-heb.1` and cannot present itself as stock. Nothing publishes that channel: no release manifest describes it, so remote auto-install refuses up front and names `HERDR_REMOTE_BINARY` instead of searching for a release that never existed, and every job in `.github/workflows/preview.yml` carries a repository guard that is false anywhere but `herdrdev/herdr`, asserted by `scripts/test_preview_fork_guard.py`. The channel and release material below describes upstream; it does not publish from here.
+
 Herdr has one main branch and two update channels. Stable and preview both build from `master`; there is no long-lived preview branch.
 
 Normal users default to stable. Stable docs are `/docs/`, stable updates use `website/latest.json`, and Homebrew/Nix stay stable-only.

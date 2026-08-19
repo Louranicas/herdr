@@ -1003,12 +1003,12 @@ mod tests {
     /// A server that cannot mint an epoch must DIE, with a code that blames the
     /// environment and a stderr line saying why.
     ///
-    /// The refusal is a process-level contract - an exit status and a message
-    /// - so it is asserted on a real process: this test re-executes the test
-    /// binary, which runs this same function again, takes the branch below
-    /// with an entropy source that is unavailable, and ends the way a server
-    /// on a machine without entropy would. Without this, "exit 69" is a line
-    /// of code nobody has ever run.
+    /// The refusal is a process-level contract - an exit status and a
+    /// message - so it is asserted on a real process: this test re-executes
+    /// the test binary, which runs this same function again, takes the branch
+    /// below with an entropy source that is unavailable, and ends the way a
+    /// server on a machine without entropy would. Without this, "exit 69" is
+    /// a line of code nobody has ever run.
     #[test]
     fn a_server_that_cannot_mint_an_epoch_exits_69_and_says_why() {
         const NAME: &str = "tests::a_server_that_cannot_mint_an_epoch_exits_69_and_says_why";
