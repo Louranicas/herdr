@@ -135,34 +135,37 @@ impl BuildIdentity {
     }
 }
 
-impl Ord for BuildIdentity {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+/// Whether `self` is strictly newer than `other`, or `None` when the two are
+/// NOT COMPARABLE.
+///
+/// Cross-channel identities at the same release are the not-comparable case:
+/// "0.8.0-heb.1 versus 0.8.0-preview.7" has no direction anybody can defend.
+/// An earlier revision ordered them by channel NAME, which is a total order
+/// and a fiction - it would have made `heb` reliably "older" than `preview`
+/// for no reason but the alphabet, and a caller asking "is this newer?" would
+/// have received a confident wrong answer instead of an honest refusal.
+impl BuildIdentity {
+    pub fn is_newer_than(&self, other: &Self) -> Option<bool> {
         use std::cmp::Ordering;
         match self.version.cmp(&other.version) {
+            Ordering::Greater => return Some(true),
+            Ordering::Less => return Some(false),
             Ordering::Equal => {}
-            unequal => return unequal,
         }
         match (&self.pre, &other.pre) {
-            // Semver's rule: a release outranks any pre-release of the same
-            // version. 0.8.0 is newer than 0.8.0-preview.999.
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
+            (None, None) => Some(false),
+            // Semver: a release outranks any pre-release of the same version.
+            (None, Some(_)) => Some(true),
+            (Some(_), None) => Some(false),
             (Some((ac, an)), Some((bc, bn))) => {
-                // Build numbers order only WITHIN a channel. Two different
-                // channels at the same version are not ranked against each
-                // other - "heb.1 vs preview.7" has no meaningful direction -
-                // so they compare by name to stay a total order without
-                // pretending one is newer.
-                ac.cmp(bc).then(an.cmp(bn))
+                if ac == bc {
+                    Some(an > bn)
+                } else {
+                    // Different channels, same release: no order.
+                    None
+                }
             }
         }
-    }
-}
-
-impl PartialOrd for BuildIdentity {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -2341,8 +2344,8 @@ mod tests {
         // same channel, one build apart.
         let a = BuildIdentity::parse("0.8.0-preview.123").expect("parses");
         let b = BuildIdentity::parse("0.8.0-preview.124").expect("parses");
-        assert!(b > a, "0.8.0-preview.124 must outrank .123");
-        assert!(a < b);
+        assert_eq!(b.is_newer_than(&a), Some(true), ".124 is newer than .123");
+        assert_eq!(a.is_newer_than(&b), Some(false));
         assert_ne!(a, b, "successive previews must not compare equal");
     }
 
@@ -2350,14 +2353,17 @@ mod tests {
     fn a_release_outranks_any_prerelease_of_the_same_version() {
         let release = BuildIdentity::parse("0.8.0").expect("parses");
         let pre = BuildIdentity::parse("0.8.0-preview.999").expect("parses");
-        assert!(release > pre, "0.8.0 is newer than 0.8.0-preview.999");
+        assert_eq!(release.is_newer_than(&pre), Some(true));
+        assert_eq!(pre.is_newer_than(&release), Some(false));
     }
 
     #[test]
     fn a_higher_release_outranks_a_lower_prerelease_and_release() {
         let next = BuildIdentity::parse("0.8.1").expect("parses");
-        assert!(next > BuildIdentity::parse("0.8.0-preview.999").expect("parses"));
-        assert!(next > BuildIdentity::parse("0.8.0").expect("parses"));
+        let older_pre = BuildIdentity::parse("0.8.0-preview.999").expect("parses");
+        let older = BuildIdentity::parse("0.8.0").expect("parses");
+        assert_eq!(next.is_newer_than(&older_pre), Some(true));
+        assert_eq!(next.is_newer_than(&older), Some(true));
     }
 
     #[test]
@@ -2380,12 +2386,23 @@ mod tests {
     fn the_fork_identity_orders_against_its_own_base() {
         let base = BuildIdentity::parse("0.8.0").expect("parses");
         let fork = BuildIdentity::parse("0.8.0-heb.1").expect("parses");
-        assert!(
-            fork < base,
+        assert_eq!(
+            fork.is_newer_than(&base),
+            Some(false),
             "a fork build is a prerelease of its base version"
         );
         let fork2 = BuildIdentity::parse("0.8.0-heb.2").expect("parses");
-        assert!(fork2 > fork, "successive fork builds are ordered");
+        assert_eq!(fork2.is_newer_than(&fork), Some(true));
+
+        // Different channels at one release have NO order, and the type says
+        // so rather than inventing one from the alphabet.
+        let preview = BuildIdentity::parse("0.8.0-preview.7").expect("parses");
+        assert_eq!(
+            fork.is_newer_than(&preview),
+            None,
+            "cross-channel is not comparable"
+        );
+        assert_eq!(preview.is_newer_than(&fork), None);
     }
     use super::*;
     use std::os::unix::net::UnixListener;

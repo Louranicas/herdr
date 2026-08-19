@@ -9,7 +9,7 @@
 //! torn down afterwards.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -132,12 +132,19 @@ impl Isolated {
             .to_string()
     }
 
-    fn server_pids(&self) -> Vec<String> {
+    /// PIDs of servers belonging to THIS socket.
+    ///
+    /// `/proc/<pid>/environ` is a Linux interface. On other platforms this
+    /// returns `None` - not an empty list, which a caller would read as
+    /// "no servers" and treat as evidence. A test that needs process proof
+    /// must skip where the proof is unavailable rather than assert over it.
+    #[cfg(target_os = "linux")]
+    fn server_pids(&self) -> Option<Vec<String>> {
         // Only processes whose environment names OUR socket - never a server
         // belonging to the developer running the suite.
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir("/proc") else {
-            return out;
+            return None;
         };
         for e in entries.flatten() {
             let pid = e.file_name().to_string_lossy().to_string();
@@ -151,7 +158,12 @@ impl Isolated {
                 }
             }
         }
-        out
+        Some(out)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn server_pids(&self) -> Option<Vec<String>> {
+        None
     }
 }
 
@@ -162,7 +174,7 @@ impl Drop for Isolated {
             let _ = c.kill();
             let _ = c.wait();
         }
-        for pid in self.server_pids() {
+        for pid in self.server_pids().unwrap_or_default() {
             let _ = Command::new("kill").args(["-9", &pid]).output();
         }
         let _ = std::fs::remove_dir_all(&self.base);
@@ -240,11 +252,16 @@ fn a_successful_handoff_rotates_the_token() {
     let after = iso.snapshot_epoch().expect("token after handoff");
     assert_ne!(before, after, "a handoff must rotate the token");
     assert!(is_lower_hex_32(&after));
-    assert_ne!(
-        pids_before,
-        iso.server_pids(),
-        "the token rotated, so the process must actually have been replaced"
-    );
+    // Process proof only where /proc exists. Elsewhere the rotation above is
+    // still asserted; what is skipped is the corroboration, and it is skipped
+    // explicitly rather than by an empty list quietly comparing equal.
+    match (pids_before, iso.server_pids()) {
+        (Some(before), Some(after)) => assert_ne!(
+            before, after,
+            "the token rotated, so the process must actually have been replaced"
+        ),
+        _ => eprintln!("process-replacement proof skipped: /proc is Linux-only"),
+    }
 }
 
 /// A handoff that FAILS must leave the incarnation alone. Rotating on a failed
@@ -283,15 +300,64 @@ fn a_failed_handoff_retains_the_token() {
 /// this field exists to make detectable.
 #[test]
 fn the_token_is_absent_from_everything_written_to_disk() {
-    let iso = Isolated::start("no-persist");
+    let iso = Isolated::start("nopers");
     iso.run(&["workspace", "create", "--label", "persist", "--focus"]);
-    let token = iso.snapshot_epoch().expect("token");
-    // Give the server every chance to persist: create state, then stop it
-    // cleanly so any save-on-shutdown path runs.
     iso.run(&["tab", "create", "--label", "t", "--focus"]);
-    let _ = iso.cmd(&["server", "stop"]).output();
-    std::thread::sleep(Duration::from_millis(800));
+    let token = iso.snapshot_epoch().expect("token");
 
+    // Stop must SUCCEED and the owned server must actually exit. A fixed sleep
+    // plus "some file exists" can pass on config.toml alone, proving nothing
+    // about what the server persisted.
+    let stop = iso.cmd(&["server", "stop"]).output().unwrap();
+    assert!(
+        stop.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match iso.server_pids() {
+            Some(p) if p.is_empty() => break,
+            // Where /proc is unavailable, fall back to the socket disappearing.
+            None if !iso.socket.exists() => break,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the owned server did not exit after a successful stop"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The session file the server is expected to write. Asserting it EXISTS is
+    // what makes the search below meaningful: without it, "no token found"
+    // could simply mean nothing was saved.
+    //
+    // Located by NAME rather than a fixed path: the config directory is
+    // `herdr` for a release build and `herdr-dev` for a debug one, and a
+    // hardcoded path silently missed the file on the profile the suite
+    // actually runs under.
+    let session_json = find_file_named(&iso.base, "session.json").unwrap_or_else(|| {
+        panic!(
+            "no session.json under {}; without a persisted session this test proves nothing",
+            iso.base.display()
+        )
+    });
+    let persisted = std::fs::read(&session_json).unwrap();
+    assert!(
+        !persisted.is_empty(),
+        "the persisted session file is empty, so nothing was actually saved"
+    );
+    assert!(
+        !find_bytes(&persisted, token.as_bytes()),
+        "the incarnation token was written into the persisted session"
+    );
+    assert!(
+        !find_bytes(&persisted, b"server_epoch"),
+        "the token's field name reached the persisted session"
+    );
+
+    // ...and nowhere else in the tree either.
     let mut searched = 0usize;
     let mut hits = Vec::new();
     let mut stack = vec![iso.base.clone()];
@@ -311,11 +377,27 @@ fn the_token_is_absent_from_everything_written_to_disk() {
             }
         }
     }
-    assert!(searched > 0, "nothing was written, so nothing was proven");
+    assert!(searched > 1, "only {searched} file(s) searched");
     assert!(
         hits.is_empty(),
         "the token or its field name reached disk in {searched} files: {hits:?}"
     );
+}
+
+/// First file with this name anywhere under `root`.
+fn find_file_named(root: &Path, name: &str) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|f| f == name) {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -338,4 +420,26 @@ fn the_token_is_never_served_as_an_empty_string() {
         epoch.is_string() && !epoch.as_str().unwrap().is_empty(),
         "a running server must carry a non-empty token"
     );
+}
+
+/// The identity as a USER sees it, from a real subprocess.
+///
+/// Every other identity assertion here reads a served field. If `--version`
+/// printed something else, none of them would notice — and `--version` is the
+/// first thing anyone checks to find out what they are running.
+#[test]
+fn the_binary_reports_the_fork_identity_on_both_version_flags() {
+    for flag in ["--version", "-V"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_herdr"))
+            .arg(flag)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{flag} exited non-zero");
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(
+            text, "herdr 0.8.0-heb.1",
+            "{flag} must print the fork identity exactly, not stock"
+        );
+    }
 }

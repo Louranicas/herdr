@@ -97,7 +97,11 @@ fn release_notes_from_stored(
         crate::update::BuildIdentity::parse(&stored.version),
         crate::update::BuildIdentity::parse(current_version),
     ) {
-        (Some(stored_identity), Some(current_identity)) => stored_identity > current_identity,
+        // `None` means the two identities are not comparable - different
+        // channels at the same release. Not comparable is not "newer".
+        (Some(stored_identity), Some(current_identity)) => stored_identity
+            .is_newer_than(&current_identity)
+            .unwrap_or(false),
         // An unparseable identity on either side is not evidence of newer
         // notes. Refusing here keeps a malformed version from presenting
         // stale notes as an update.
@@ -180,6 +184,68 @@ pub fn normalize_body(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The caller, not the comparator. `BuildIdentity` ordering can be correct
+    /// while `release_notes` still hands it the wrong strings — comparing on
+    /// BASE_VERSION did exactly that, and every comparator test passed.
+    #[test]
+    fn a_newer_preview_build_is_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.124".to_string(),
+            body: "### Changed\n- newer preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes = super::release_notes_from_stored(stored, "0.8.0-preview.123")
+            .expect("newer notes must be reported");
+        assert!(
+            notes.preview,
+            "0.8.0-preview.124 is newer than the running .123 and must read as preview"
+        );
+    }
+
+    #[test]
+    fn an_older_preview_build_is_not_reported_as_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.122".to_string(),
+            body: "### Changed\n- older preview".to_string(),
+            show_on_startup: true,
+        };
+        let notes = super::release_notes_from_stored(stored, "0.8.0-preview.123")
+            .expect("notes are still returned");
+        assert!(!notes.preview, "an older build is not an update");
+    }
+
+    /// Cross-channel at one release is NOT comparable, and not-comparable is
+    /// not "newer". Ordering these by channel name would have made the answer
+    /// depend on the alphabet.
+    #[test]
+    fn a_different_channel_at_the_same_release_is_not_preview() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0-preview.999".to_string(),
+            body: "### Changed\n- other channel".to_string(),
+            show_on_startup: true,
+        };
+        let notes = super::release_notes_from_stored(stored, "0.8.0-heb.1")
+            .expect("notes are still returned");
+        assert!(
+            !notes.preview,
+            "no order across channels means no update claim"
+        );
+    }
+
+    /// The regression that motivated the change: a stable release is newer
+    /// than any pre-release of the same version.
+    #[test]
+    fn a_stable_release_outranks_the_running_prerelease() {
+        let stored = super::StoredReleaseNotes {
+            version: "0.8.0".to_string(),
+            body: "### Changed\n- stable".to_string(),
+            show_on_startup: true,
+        };
+        let notes =
+            super::release_notes_from_stored(stored, "0.8.0-heb.1").expect("notes are returned");
+        assert!(notes.preview, "0.8.0 is newer than 0.8.0-heb.1");
+    }
     use super::*;
 
     #[test]

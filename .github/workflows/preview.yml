@@ -1,13 +1,19 @@
 name: Preview
 
+# FORK BRANCH: automatic preview publishing is DISABLED.
+#
+# build.rs stamps this fork's identity unconditionally, so every binary
+# reports 0.8.0-heb.1. This workflow sets HERDR_BUILD_CHANNEL=preview and
+# publishes metadata saying `channel=preview` with its own build id - so a
+# preview publish from this fork would ship a binary calling itself `heb`
+# alongside release metadata calling it `preview`. Two different answers to
+# 'what am I running?' is worse than either one alone.
+#
+# The coherent policy for a fork is not to publish preview builds at all.
+# Left runnable by hand so the workflow can still be inspected or repaired,
+# but never triggered by a push or a schedule.
 on:
   workflow_dispatch:
-    inputs:
-      commit:
-        description: Optional master commit SHA to publish
-        required: false
-        type: string
-
 permissions:
   contents: read
 
