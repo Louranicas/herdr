@@ -333,6 +333,12 @@ fn ping_over_socket_returns_version() {
     // preview build - serves a different string by design. Recomposed from the
     // same compile-time inputs, so the check stays exact either way.
     assert_eq!(value["result"]["version"], expected_version());
+    // Exact, not merely self-consistent: a recomposition that happened to
+    // produce the stock string would still match itself.
+    assert_eq!(
+        value["result"]["version"], "0.8.0-heb.1",
+        "ping must serve the fork identity"
+    );
     assert!(
         expected_version().starts_with(env!("CARGO_PKG_VERSION")),
         "the served identity must still be rooted in the package version"

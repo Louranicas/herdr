@@ -89,6 +89,83 @@ impl Version {
     }
 }
 
+/// A full build identity: a release version plus, for a non-stable channel, the
+/// channel and its build number — exactly what `build_info::version()` emits.
+///
+/// `Version` alone cannot order these. It carries major/minor/patch only, so
+/// `0.8.0-preview.123` and `0.8.0-preview.124` are indistinguishable to it, and
+/// both fail its three-part parse outright. Comparing release notes on
+/// `BASE_VERSION` sidesteps that by making every non-stable identity equal —
+/// which stops newer preview notes being recognised at all, trading one silent
+/// failure for another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildIdentity {
+    pub version: Version,
+    /// `None` on the stable channel. `Some((channel, build))` otherwise.
+    pub pre: Option<(String, u64)>,
+}
+
+impl BuildIdentity {
+    /// Accepts `X.Y.Z`, `X.Y.Z-channel`, and `X.Y.Z-channel.N`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let (core, pre) = match s.split_once('-') {
+            None => (s, None),
+            Some((core, rest)) => {
+                let (channel, build) = match rest.rsplit_once('.') {
+                    // A trailing numeric segment is the build number; anything
+                    // else is part of the channel name, so `-rc.candidate`
+                    // stays one channel rather than becoming build "candidate".
+                    Some((channel, num)) => match num.parse::<u64>() {
+                        Ok(n) => (channel.to_string(), n),
+                        Err(_) => (rest.to_string(), 0),
+                    },
+                    None => (rest.to_string(), 0),
+                };
+                if channel.is_empty() {
+                    return None;
+                }
+                (core, Some((channel, build)))
+            }
+        };
+        Some(Self {
+            version: Version::parse(core)?,
+            pre,
+        })
+    }
+}
+
+impl Ord for BuildIdentity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match self.version.cmp(&other.version) {
+            Ordering::Equal => {}
+            unequal => return unequal,
+        }
+        match (&self.pre, &other.pre) {
+            // Semver's rule: a release outranks any pre-release of the same
+            // version. 0.8.0 is newer than 0.8.0-preview.999.
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some((ac, an)), Some((bc, bn))) => {
+                // Build numbers order only WITHIN a channel. Two different
+                // channels at the same version are not ranked against each
+                // other - "heb.1 vs preview.7" has no meaningful direction -
+                // so they compare by name to stay a total order without
+                // pretending one is newer.
+                ac.cmp(bc).then(an.cmp(bn))
+            }
+        }
+    }
+}
+
+impl PartialOrd for BuildIdentity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
@@ -2257,6 +2334,59 @@ fn platform_target() -> (&'static str, &'static str) {
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[test]
+    fn successive_preview_builds_are_ordered() {
+        // The case BASE_VERSION-only comparison could not see: same release,
+        // same channel, one build apart.
+        let a = BuildIdentity::parse("0.8.0-preview.123").expect("parses");
+        let b = BuildIdentity::parse("0.8.0-preview.124").expect("parses");
+        assert!(b > a, "0.8.0-preview.124 must outrank .123");
+        assert!(a < b);
+        assert_ne!(a, b, "successive previews must not compare equal");
+    }
+
+    #[test]
+    fn a_release_outranks_any_prerelease_of_the_same_version() {
+        let release = BuildIdentity::parse("0.8.0").expect("parses");
+        let pre = BuildIdentity::parse("0.8.0-preview.999").expect("parses");
+        assert!(release > pre, "0.8.0 is newer than 0.8.0-preview.999");
+    }
+
+    #[test]
+    fn a_higher_release_outranks_a_lower_prerelease_and_release() {
+        let next = BuildIdentity::parse("0.8.1").expect("parses");
+        assert!(next > BuildIdentity::parse("0.8.0-preview.999").expect("parses"));
+        assert!(next > BuildIdentity::parse("0.8.0").expect("parses"));
+    }
+
+    #[test]
+    fn build_identity_parses_every_shape_build_info_emits() {
+        let stable = BuildIdentity::parse("0.8.0").expect("stable");
+        assert!(stable.pre.is_none());
+        let no_id = BuildIdentity::parse("0.8.0-heb").expect("channel without build id");
+        assert_eq!(no_id.pre, Some(("heb".to_string(), 0)));
+        let with_id = BuildIdentity::parse("0.8.0-heb.1").expect("channel with build id");
+        assert_eq!(with_id.pre, Some(("heb".to_string(), 1)));
+        // A non-numeric trailing segment belongs to the channel name, not the
+        // build number.
+        let dotted = BuildIdentity::parse("0.8.0-rc.candidate").expect("dotted channel");
+        assert_eq!(dotted.pre, Some(("rc.candidate".to_string(), 0)));
+        assert!(BuildIdentity::parse("not-a-version").is_none());
+        assert!(BuildIdentity::parse("0.8.0-").is_none());
+    }
+
+    #[test]
+    fn the_fork_identity_orders_against_its_own_base() {
+        let base = BuildIdentity::parse("0.8.0").expect("parses");
+        let fork = BuildIdentity::parse("0.8.0-heb.1").expect("parses");
+        assert!(
+            fork < base,
+            "a fork build is a prerelease of its base version"
+        );
+        let fork2 = BuildIdentity::parse("0.8.0-heb.2").expect("parses");
+        assert!(fork2 > fork, "successive fork builds are ordered");
+    }
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::sync::{

@@ -41,4 +41,24 @@ mod tests {
     fn stable_version_defaults_to_cargo_version() {
         assert!(!super::version().is_empty());
     }
+
+    /// FORK BRANCH ASSERTION. The deployed binary must not present itself as
+    /// stock, and a test that accepts either identity cannot detect it doing
+    /// so — which is how a CI or `cargo install` build silently ships stock.
+    /// `build.rs` stamps the channel unconditionally and is tracked, so this
+    /// is exact rather than conditional.
+    ///
+    /// On an upstream tree without that stamp this test fails, which is
+    /// correct: it is a fork-identity assertion and does not belong upstream.
+    #[test]
+    fn the_fork_identity_is_exact() {
+        assert_eq!(super::channel(), "heb");
+        assert_eq!(super::build_id(), Some("1"));
+        assert_eq!(
+            super::version(),
+            "0.8.0-heb.1",
+            "the fork must report its own identity, never stock"
+        );
+        assert_ne!(super::version(), super::BASE_VERSION);
+    }
 }

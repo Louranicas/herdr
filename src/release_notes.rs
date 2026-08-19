@@ -71,15 +71,12 @@ fn load_stored_from_path(path: &Path) -> Option<StoredReleaseNotes> {
 }
 
 pub fn load_latest() -> Option<ReleaseNotes> {
-    // BASE_VERSION, not version(): this argument is used ONLY for a semver
-    // comparison, while version() is a display composition. Version::parse
-    // requires exactly three dot-separated numbers, so a composed identity
-    // like "0.8.0-heb.1" (any non-stable channel, including upstream preview
-    // builds) parses to None and the match below falls to `_ => false`,
-    // silently disabling newer-release-notes detection. Passing the display
-    // string was only ever correct because the stable channel makes the two
-    // equal.
-    load_latest_from_path(&pending_path(), crate::build_info::BASE_VERSION)
+    // The FULL build identity, not BASE_VERSION. Comparing on the base alone
+    // made every non-stable identity equal, so successive preview builds
+    // (0.8.0-preview.123 -> .124) could never show newer notes. Comparing on
+    // the display string with `Version::parse` was the opposite failure: it
+    // parses to None and disables the check entirely.
+    load_latest_from_path(&pending_path(), &crate::build_info::version())
 }
 
 fn load_latest_from_path(path: &Path, current_version: &str) -> Option<ReleaseNotes> {
@@ -97,10 +94,13 @@ fn release_notes_from_stored(
     }
 
     let preview = match (
-        crate::update::Version::parse(&stored.version),
-        crate::update::Version::parse(current_version),
+        crate::update::BuildIdentity::parse(&stored.version),
+        crate::update::BuildIdentity::parse(current_version),
     ) {
-        (Some(stored_version), Some(current_version)) => stored_version > current_version,
+        (Some(stored_identity), Some(current_identity)) => stored_identity > current_identity,
+        // An unparseable identity on either side is not evidence of newer
+        // notes. Refusing here keeps a malformed version from presenting
+        // stale notes as an update.
         _ => false,
     };
 

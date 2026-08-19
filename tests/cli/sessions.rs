@@ -480,6 +480,10 @@ fn status_commands_report_client_and_server_versions() {
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], expected_version());
+    assert_eq!(
+        full_json["client"]["version"], "0.8.0-heb.1",
+        "status must report the fork identity"
+    );
     assert_eq!(full_json["client"]["protocol"], 20);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
@@ -494,6 +498,10 @@ fn status_commands_report_client_and_server_versions() {
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], expected_version());
+    assert_eq!(
+        server_json["version"], "0.8.0-heb.1",
+        "the server must report the fork identity"
+    );
     assert_eq!(server_json["protocol"], 20);
     assert_eq!(server_json["compatible"], true);
 
