@@ -573,3 +573,69 @@ fn the_token_is_stable_where_live_handoff_is_unsupported() {
         "nothing was replaced, so the incarnation must not have changed"
     );
 }
+
+/// A configured update source must not reach the Windows installer.
+///
+/// On Windows `install_windows_update_with_installer` runs
+/// `irm https://herdr.dev/install.ps1 | iex` and passes it only a channel and
+/// a build id. The `download_url` and `sha256` the manifest supplied are
+/// discarded, so a configured source would decide the release notes and
+/// whether an update is offered while upstream's script decided the binary -
+/// replacing this fork with an unrelated build.
+///
+/// Native, and behavioural rather than structural: it runs the real binary
+/// with the variable set and requires the refusal to arrive without the
+/// installer being invoked. `PATH` is emptied so that any attempt to launch
+/// `powershell` fails loudly rather than silently succeeding against the real
+/// one - a refusal that happens to run the installer first would otherwise
+/// look identical to a refusal that never did.
+#[cfg(not(unix))]
+#[test]
+fn a_configured_update_source_never_reaches_the_windows_installer() {
+    let identity_before = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("--version")
+        .output()
+        .expect("version");
+    let identity_before = String::from_utf8_lossy(&identity_before.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !identity_before.is_empty(),
+        "the running build must report an identity for this test to mean anything"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("update")
+        .env("HERDR_UPDATE_SOURCE", "https://example.invalid/fork.json")
+        .env("PATH", "")
+        .output()
+        .expect("update");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let combined = format!("{stdout}\n{stderr}");
+
+    assert!(
+        !out.status.success(),
+        "update must refuse; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        combined.contains("HERDR_UPDATE_SOURCE"),
+        "the refusal must name the setting it is refusing: {combined}"
+    );
+    assert!(
+        !combined.contains("install.ps1"),
+        "the Windows installer was reached despite a configured source: {combined}"
+    );
+
+    // Identity cannot have mixed: the binary that answered before is the one
+    // answering now.
+    let identity_after = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("--version")
+        .output()
+        .expect("version");
+    assert_eq!(
+        String::from_utf8_lossy(&identity_after.stdout).trim(),
+        identity_before,
+        "the running build's identity changed across a refused update"
+    );
+}

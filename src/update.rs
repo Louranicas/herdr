@@ -461,6 +461,7 @@ fn unpublished_channel_update_refusal(
     channel: &str,
     fork_source: Option<&str>,
     manager: Option<&str>,
+    windows: bool,
 ) -> Option<String> {
     if crate::build_info::is_published_channel(channel) {
         return None;
@@ -474,8 +475,17 @@ fn unpublished_channel_update_refusal(
         ),
         None => "install a new build of it the way this one was installed".to_string(),
     };
+    // Naming the variable here would send a Windows operator into a loop: the
+    // advice is to set it, and setting it is refused on this platform because
+    // the Windows path installs through upstream's script rather than the
+    // asset a manifest names.
+    let route_out = if windows {
+        String::new()
+    } else {
+        format!("set {FORK_UPDATE_SOURCE_ENV} to a manifest URL for this build's own channel, or ")
+    };
     Some(format!(
-        "this herdr is built on the `{channel}` channel, which no published release manifest describes, so updating from one would replace this build with an unrelated upstream binary; set {FORK_UPDATE_SOURCE_ENV} to a manifest URL for this build's own channel, or {remedy}"
+        "this herdr is built on the `{channel}` channel, which no published release manifest describes, so updating from one would replace this build with an unrelated upstream binary; {route_out}{remedy}"
     ))
 }
 
@@ -626,10 +636,15 @@ fn update_refusal(
     channel: &str,
     fork_source: Option<&str>,
     manager: Option<&str>,
+    windows: bool,
 ) -> Option<String> {
     published_channel_rejects_update_source(channel, fork_source)
+        // Ahead of fetchability and of the manager conflict: both of those
+        // answer "install directly to update from your source", which Windows
+        // cannot do either, so their advice would be wrong here.
+        .or_else(|| update_source_unsupported_on_windows(fork_source, windows))
         .or_else(|| unusable_update_source_refusal(fork_source))
-        .or_else(|| unpublished_channel_update_refusal(channel, fork_source, manager))
+        .or_else(|| unpublished_channel_update_refusal(channel, fork_source, manager, windows))
         .or_else(|| update_source_conflicts_with_manager(channel, fork_source, manager))
 }
 
@@ -639,6 +654,7 @@ fn current_update_refusal() -> Option<String> {
         crate::build_info::channel(),
         fork_update_source().as_deref(),
         managed_install_name(),
+        cfg!(windows),
     )
 }
 
@@ -655,6 +671,41 @@ fn current_update_refusal() -> Option<String> {
 /// that no longer selects anything for it.
 fn fetches_preview_manifest(channel: &str, configured: UpdateChannel) -> bool {
     crate::build_info::is_published_channel(channel) && configured == UpdateChannel::Preview
+}
+
+/// Why a configured update source cannot be honoured on Windows.
+///
+/// The Windows install path does not use the manifest's asset at all.
+/// `install_windows_update_with_installer` runs
+/// `irm https://herdr.dev/install.ps1 | iex` and passes it only a channel and
+/// a build id; the `download_url` and `sha256` the manifest supplied are
+/// discarded. So a configured source decides the notes and whether an update
+/// is offered, and upstream's installer then decides the binary - the same
+/// mixing the manager refusal prevents, except here the two halves cannot be
+/// separated by choosing a different install method, because there is only
+/// one.
+///
+/// Refusing is the conservative resolution. Honouring the source would mean
+/// implementing a direct asset-plus-checksum install for Windows, which is new
+/// download, verification and replacement machinery on the platform where this
+/// binary is least able to overwrite itself while running. Until that exists,
+/// a fork on Windows updates the way it was installed.
+///
+/// `windows` is a parameter rather than `cfg!(windows)` read inside, so the
+/// rule is exercised from any host. A policy that can only be tested on the
+/// platform it governs is a policy tested nowhere until CI happens to run
+/// there.
+fn update_source_unsupported_on_windows(
+    fork_source: Option<&str>,
+    windows: bool,
+) -> Option<String> {
+    if !windows {
+        return None;
+    }
+    let source = fork_source.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(format!(
+        "{FORK_UPDATE_SOURCE_ENV} is set to {source}, but the Windows update path installs through upstream's install script rather than the asset a manifest names, so the notes would come from {source} and the binary from upstream. Update this build the way it was installed, or unset {FORK_UPDATE_SOURCE_ENV}"
+    ))
 }
 
 fn resolve_manifest_url(published: &str, channel: &str, fork_source: Option<&str>) -> String {
@@ -4034,15 +4085,15 @@ mod tests {
     #[test]
     fn published_channels_resolve_updates_from_their_manifest() {
         assert_eq!(
-            unpublished_channel_update_refusal("stable", None, None),
+            unpublished_channel_update_refusal("stable", None, None, false),
             None
         );
         assert_eq!(
-            unpublished_channel_update_refusal("preview", None, None),
+            unpublished_channel_update_refusal("preview", None, None, false),
             None
         );
         assert_eq!(
-            unpublished_channel_update_refusal("stable", None, Some("Homebrew")),
+            unpublished_channel_update_refusal("stable", None, Some("Homebrew"), false),
             None
         );
     }
@@ -4055,7 +4106,7 @@ mod tests {
     /// cannot see the problem.
     #[test]
     fn an_unpublished_channel_refuses_to_update_from_a_published_manifest() {
-        let message = unpublished_channel_update_refusal("heb", None, None)
+        let message = unpublished_channel_update_refusal("heb", None, None, false)
             .expect("an unpublished channel must refuse to self-update");
         assert!(
             message.contains("heb"),
@@ -4083,7 +4134,8 @@ mod tests {
     #[test]
     fn this_fork_refuses_to_self_update() {
         assert!(
-            unpublished_channel_update_refusal(crate::build_info::channel(), None, None).is_some(),
+            unpublished_channel_update_refusal(crate::build_info::channel(), None, None, false)
+                .is_some(),
             "channel {:?} would self-update from a published manifest",
             crate::build_info::channel()
         );
@@ -4100,14 +4152,15 @@ mod tests {
             unpublished_channel_update_refusal(
                 "heb",
                 Some("https://example.invalid/fork.json"),
-                None
+                None,
+                false
             ),
             None,
             "an explicitly configured source must lift the refusal"
         );
         assert_eq!(
-            unpublished_channel_update_refusal("heb", Some("   "), None),
-            unpublished_channel_update_refusal("heb", None, None),
+            unpublished_channel_update_refusal("heb", Some("   "), None, false),
+            unpublished_channel_update_refusal("heb", None, None, false),
             "a blank source is not a configured source"
         );
         // Unset: the published URL is used unchanged.
@@ -4225,6 +4278,67 @@ mod tests {
         );
     }
 
+    /// Windows discards the manifest's asset, so a source cannot be honoured.
+    ///
+    /// `install_windows_update_with_installer` runs upstream's install script
+    /// and passes it a channel and a build id; the `download_url` and
+    /// `sha256` the manifest supplied never reach it. A configured source
+    /// would therefore choose the notes while upstream chose the binary.
+    ///
+    /// The platform is a parameter, so this runs from any host. A policy
+    /// testable only on the platform it governs is tested nowhere until CI
+    /// happens to go there - which is precisely how the Windows path kept its
+    /// gap while every other route was closed.
+    #[test]
+    fn windows_refuses_a_configured_update_source() {
+        let source = Some("https://example.invalid/fork.json");
+        let message = update_source_unsupported_on_windows(source, true)
+            .expect("windows must refuse a configured source");
+        assert!(
+            message.contains(FORK_UPDATE_SOURCE_ENV),
+            "the refusal must name the setting: {message}"
+        );
+
+        // Elsewhere the source is honoured; this refusal is Windows-only.
+        assert_eq!(update_source_unsupported_on_windows(source, false), None);
+        // Nothing configured is nothing to refuse, on either platform.
+        assert_eq!(update_source_unsupported_on_windows(None, true), None);
+        assert_eq!(update_source_unsupported_on_windows(Some("  "), true), None);
+    }
+
+    /// On Windows the refusal wins over advice that cannot be followed there.
+    ///
+    /// The manager conflict answers "install this build directly to update it
+    /// from your source", and the unpublished-channel refusal answers "set
+    /// HERDR_UPDATE_SOURCE". Neither is achievable on Windows, and the second
+    /// would loop an operator straight back into the refusal they just hit.
+    #[test]
+    fn windows_advice_never_points_at_a_route_windows_refuses() {
+        let source = Some("https://example.invalid/fork.json");
+        let windows = update_refusal("heb", source, Some("Homebrew"), true)
+            .expect("a configured source on windows must refuse");
+        assert!(
+            !windows.contains("Install this build directly"),
+            "windows cannot honour a source through a direct install either: {windows}"
+        );
+
+        // With nothing configured, the remedy must not name the variable that
+        // this platform refuses.
+        let unconfigured = update_refusal("heb", None, None, true)
+            .expect("an unpublished channel must still refuse");
+        assert!(
+            !unconfigured.contains(FORK_UPDATE_SOURCE_ENV),
+            "windows advice must not send the operator to a setting it refuses: {unconfigured}"
+        );
+        // Off Windows that route is real and must still be offered.
+        let elsewhere = update_refusal("heb", None, None, false)
+            .expect("an unpublished channel must still refuse");
+        assert!(
+            elsewhere.contains(FORK_UPDATE_SOURCE_ENV),
+            "off windows the source route is the way out: {elsewhere}"
+        );
+    }
+
     /// The half a refusal at the fetch cannot reach.
     ///
     /// With a source configured the fork refusal lifts, and the Homebrew
@@ -4278,8 +4392,9 @@ mod tests {
                 Some(manager),
             )
             .expect("a configured source conflicts with a manager");
-            let unconfigured = unpublished_channel_update_refusal("heb", None, Some(manager))
-                .expect("an unpublished channel refuses to self-update");
+            let unconfigured =
+                unpublished_channel_update_refusal("heb", None, Some(manager), false)
+                    .expect("an unpublished channel refuses to self-update");
 
             for message in [&configured, &unconfigured] {
                 assert!(
@@ -4372,7 +4487,7 @@ mod tests {
                 "the refusal must name the setting and what it requires: {message}"
             );
             assert_eq!(
-                update_refusal("heb", Some(hostile), None),
+                update_refusal("heb", Some(hostile), None, false),
                 Some(message),
                 "the refusal has to reach the dispatch, not just exist"
             );
@@ -4396,30 +4511,33 @@ mod tests {
 
         // A stock build with nothing configured updates normally, manager or
         // not; a refusal here would strand every ordinary install.
-        assert_eq!(update_refusal("stable", None, None), None);
-        assert_eq!(update_refusal("stable", None, Some("Homebrew")), None);
-        assert_eq!(update_refusal("preview", None, None), None);
+        assert_eq!(update_refusal("stable", None, None, false), None);
+        assert_eq!(
+            update_refusal("stable", None, Some("Homebrew"), false),
+            None
+        );
+        assert_eq!(update_refusal("preview", None, None, false), None);
 
         // Set on a published channel: refused rather than discarded silently.
-        assert!(update_refusal("stable", source, None)
+        assert!(update_refusal("stable", source, None, false)
             .is_some_and(|message| message.contains("stable")));
         // ...and the published refusal is what is said, not the manager one.
         assert_eq!(
-            update_refusal("stable", source, Some("Homebrew")),
+            update_refusal("stable", source, Some("Homebrew"), false),
             published_channel_rejects_update_source("stable", source)
         );
 
         // The fork: refused with nothing configured, delivered with a source,
         // refused again when the binary belongs to a manager.
-        assert!(update_refusal("heb", None, None).is_some());
-        assert_eq!(update_refusal("heb", source, None), None);
+        assert!(update_refusal("heb", None, None, false).is_some());
+        assert_eq!(update_refusal("heb", source, None, false), None);
         assert_eq!(
-            update_refusal("heb", source, Some("mise")),
+            update_refusal("heb", source, Some("mise"), false),
             update_source_conflicts_with_manager("heb", source, Some("mise"))
         );
         assert_eq!(
-            update_refusal("heb", Some("  "), None),
-            update_refusal("heb", None, None),
+            update_refusal("heb", Some("  "), None, false),
+            update_refusal("heb", None, None, false),
             "a blank source configures nothing"
         );
     }

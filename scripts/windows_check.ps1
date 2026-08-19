@@ -177,4 +177,8 @@ Invoke-CargoTestFilter "app::tests::native_repeats_and_releases_follow_the_press
 # so the token must NOT rotate. That test is the only coverage this platform
 # has for the feature, and until this line it was never compiled.
 Invoke-CargoIntegrationTest -Target "server_epoch" -RequiredTest "the_token_is_stable_where_live_handoff_is_unsupported"
+# The Windows update path installs through upstream's script rather than the
+# asset a manifest names, so a configured update source must be refused before
+# it is reached. Only Windows can prove that, and only by running.
+Invoke-CargoIntegrationTest -Target "server_epoch" -RequiredTest "a_configured_update_source_never_reaches_the_windows_installer"
 Invoke-Checked cargo @("build", "--locked", "--target", "x86_64-pc-windows-msvc")
