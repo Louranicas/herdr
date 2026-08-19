@@ -10,8 +10,14 @@ name: Preview
 # 'what am I running?' is worse than either one alone.
 #
 # The coherent policy for a fork is not to publish preview builds at all.
-# Left runnable by hand so the workflow can still be inspected or repaired,
-# but never triggered by a push or a schedule.
+#
+# `workflow_dispatch`-only is NOT that policy: it removes the automatic
+# triggers and then relies on nobody pressing the button. Every job therefore
+# carries a repository guard that evaluates FALSE anywhere but upstream, so a
+# manual run on this fork resolves to skipped jobs and publishes nothing.
+#
+# The guard is asserted, not trusted: scripts/test_preview_fork_guard.py parses
+# this file and fails if any job loses it.
 on:
   workflow_dispatch:
 permissions:
@@ -27,6 +33,8 @@ concurrency:
 
 jobs:
   preflight:
+    # FORK GUARD: false on any repository but upstream.
+    if: github.repository == 'ogulcancelik/herdr'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -124,7 +132,8 @@ jobs:
 
   build:
     needs: preflight
-    if: needs.preflight.outputs.should_publish == 'true'
+    # FORK GUARD: false on any repository but upstream.
+    if: github.repository == 'ogulcancelik/herdr' && needs.preflight.outputs.should_publish == 'true'
     permissions:
       contents: read
     strategy:
@@ -290,7 +299,8 @@ jobs:
 
   publish:
     needs: [preflight, build]
-    if: needs.preflight.outputs.should_publish == 'true'
+    # FORK GUARD: false on any repository but upstream.
+    if: github.repository == 'ogulcancelik/herdr' && needs.preflight.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: docs-publish-master
