@@ -29,6 +29,43 @@ function Invoke-CargoWithZigCacheRecovery {
     Invoke-Checked cargo $Arguments
 }
 
+function Get-CargoTestNames {
+    <#
+    .SYNOPSIS
+    Enumerate the tests a cargo invocation would run.
+
+    .DESCRIPTION
+    One definition of the enumeration contract - the `--list` call, its exit
+    status, the harness listing format, and the refusal to treat an empty
+    selection as a pass - so a correction to any of them lands everywhere.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments,
+        [Parameter(Mandatory)]
+        [string]$Description
+    )
+
+    $listOutput = @(& cargo @Arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "could not enumerate tests for $Description`: $($listOutput -join [Environment]::NewLine)"
+    }
+
+    $names = @(
+        foreach ($line in $listOutput) {
+            $match = [regex]::Match([string]$line, '^\s*(\S+): test\s*$')
+            if ($match.Success) {
+                $match.Groups[1].Value
+            }
+        }
+    )
+    if ($names.Count -eq 0) {
+        throw "$Description selected zero tests"
+    }
+
+    return ,$names
+}
+
 function Invoke-CargoTestFilter {
     param(
         [Parameter(Mandatory)]
@@ -51,22 +88,7 @@ function Invoke-CargoTestFilter {
     }
 
     $listArguments = $commonArguments + @("--") + $harnessArguments
-    $listOutput = @(& cargo @listArguments)
-    if ($LASTEXITCODE -ne 0) {
-        throw "could not enumerate tests for filter '$Filter': $($listOutput -join [Environment]::NewLine)"
-    }
-
-    $testNames = @(
-        foreach ($line in $listOutput) {
-            $match = [regex]::Match([string]$line, '^\s*(\S+): test\s*$')
-            if ($match.Success) {
-                $match.Groups[1].Value
-            }
-        }
-    )
-    if ($testNames.Count -eq 0) {
-        throw "test filter '$Filter' selected zero tests"
-    }
+    $testNames = @(Get-CargoTestNames -Arguments $listArguments -Description "test filter '$Filter'")
 
     Write-Host "Running $($testNames.Count) test(s) for '$Filter'"
     $runArguments = $commonArguments
@@ -79,8 +101,8 @@ function Invoke-CargoTestFilter {
 function Invoke-CargoIntegrationTest {
     <#
     .SYNOPSIS
-    Run one integration test target on Windows, and prove a named test in it
-    actually executed.
+    Run one named test out of an integration test target on Windows, and prove
+    that test actually exists there.
 
     .DESCRIPTION
     Invoke-CargoTestFilter hardcodes `--bin herdr`, so it can only reach unit
@@ -88,11 +110,17 @@ function Invoke-CargoIntegrationTest {
     through it at any filter. That gap is invisible in a green run - Windows CI
     reported success while never compiling the target at all.
 
-    RequiredTest is the non-vacuity guard. A test body behind
-    `#[cfg(not(unix))]` that stops compiling on Windows removes itself from the
-    listing rather than failing, so "the suite passed" and "the platform has no
-    coverage" produce identical output. Naming the test makes its absence an
-    error.
+    RequiredTest is both the non-vacuity guard and the entire run. A test body
+    behind `#[cfg(not(unix))]` that stops compiling on Windows removes itself
+    from the listing rather than failing, so "the suite passed" and "the
+    platform has no coverage" produce identical output. Naming the test makes
+    its absence an error.
+
+    The run is scoped to RequiredTest, not the whole target. The target still
+    compiles in full, so a Windows build break is still caught, while the job's
+    runtime stays bounded by tests known to pass on this platform rather than
+    by whatever else the target happens to contain. Widening coverage here is a
+    deliberate act: name each further test once it is known to pass on Windows.
     #>
     param(
         [Parameter(Mandatory)]
@@ -110,29 +138,15 @@ function Invoke-CargoIntegrationTest {
         $Target
     )
 
+    $description = "integration target '$Target'"
     $listArguments = $commonArguments + @("--", "--list")
-    $listOutput = @(& cargo @listArguments)
-    if ($LASTEXITCODE -ne 0) {
-        throw "could not enumerate tests in target '$Target': $($listOutput -join [Environment]::NewLine)"
-    }
-
-    $testNames = @(
-        foreach ($line in $listOutput) {
-            $match = [regex]::Match([string]$line, '^\s*(\S+): test\s*$')
-            if ($match.Success) {
-                $match.Groups[1].Value
-            }
-        }
-    )
-    if ($testNames.Count -eq 0) {
-        throw "integration target '$Target' selected zero tests"
-    }
+    $testNames = @(Get-CargoTestNames -Arguments $listArguments -Description $description)
     if ($testNames -notcontains $RequiredTest) {
-        throw "integration target '$Target' does not contain '$RequiredTest'; it was cfg'd out rather than run, so this platform has no coverage for it. Found: $($testNames -join ', ')"
+        throw "$description does not contain '$RequiredTest'; it was cfg'd out rather than run, so this platform has no coverage for it. Found: $($testNames -join ', ')"
     }
 
-    Write-Host "Running $($testNames.Count) test(s) in target '$Target' (requires '$RequiredTest')"
-    Invoke-Checked cargo $commonArguments
+    Write-Host "Running '$RequiredTest' from $description"
+    Invoke-Checked cargo ($commonArguments + @("--", "--exact", $RequiredTest))
 }
 
 Invoke-Checked rustup @("target", "add", "x86_64-pc-windows-msvc")

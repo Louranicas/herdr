@@ -196,9 +196,7 @@ impl BuildIdentity {
             pre,
         })
     }
-}
 
-impl BuildIdentity {
     pub fn is_newer_than(&self, other: &Self) -> Option<bool> {
         use std::cmp::Ordering;
         match self.version.cmp(&other.version) {

@@ -83,16 +83,27 @@ pub fn init() -> Result<(), EntropyUnavailable> {
 }
 
 fn init_with(fill: Fill) -> Result<(), EntropyUnavailable> {
+    init_into(&EPOCH, fill)
+}
+
+/// The publish rule, with its destination cell as an injection point.
+///
+/// Production always passes `EPOCH`. The cell is a parameter for the same
+/// reason `Fill` is one: whether a refusal leaves the destination EMPTY is not
+/// observable on a process-wide cell unless the observer owns the whole
+/// process, so stated against `EPOCH` that property answers to test ordering
+/// instead of to this function.
+fn init_into(cell: &OnceLock<String>, fill: Fill) -> Result<(), EntropyUnavailable> {
     // Already minted: return success without touching the RNG. Drawing again
     // would let a second call FAIL over a token that is present and perfectly
     // valid - reporting an error about a state that is fine.
-    if EPOCH.get().is_some() {
+    if cell.get().is_some() {
         return Ok(());
     }
     let hex = mint_with(fill)?;
     // A second init is a programming error, not a reason to re-mint: the
     // token must be stable for the life of the process.
-    let _ = EPOCH.set(hex);
+    let _ = cell.set(hex);
     Ok(())
 }
 
@@ -190,21 +201,36 @@ mod tests {
         );
     }
 
-    /// A refused mint must leave the cell EMPTY, so `server_epoch()` keeps
-    /// reporting unavailable and no response can carry a fabricated token.
+    /// A refused mint must leave the cell EMPTY, so the reader keeps reporting
+    /// unavailable and no response can carry a fabricated token.
     ///
-    /// Relies on this test owning the process-wide `OnceLock`, which the
-    /// project's runner (nextest, one process per test) gives it.
+    /// Asserted on a private cell rather than `EPOCH`: the precondition -
+    /// nothing has minted yet - is constructed here instead of assumed of the
+    /// process, so the verdict is a fact about `init_into` rather than about
+    /// which sibling test happened to run first.
     #[test]
     fn a_refused_mint_publishes_no_token() {
+        let cell = OnceLock::new();
+        init_into(&cell, entropy_unavailable).expect_err("init must propagate the refusal");
         assert!(
-            server_epoch().is_none(),
-            "this test must own the cell; nothing may have minted before it"
-        );
-        init_without_entropy_for_test().expect_err("init must propagate the refusal");
-        assert!(
-            server_epoch().is_none(),
+            cell.get().is_none(),
             "a refused mint must publish nothing, not an empty or partial token"
+        );
+    }
+
+    /// A cell that already holds a token must survive a later refusal: the
+    /// second call must not fail over a state that is fine, and must not
+    /// replace the value that is already published.
+    #[test]
+    fn an_already_minted_cell_is_untouched_by_a_later_refusal() {
+        let cell = OnceLock::new();
+        init_into(&cell, getrandom::fill).expect("entropy");
+        let minted = cell.get().expect("initialised").to_string();
+        init_into(&cell, entropy_unavailable).expect("an already-minted cell must not fail");
+        assert_eq!(
+            cell.get().map(String::as_str),
+            Some(minted.as_str()),
+            "a refusal after a successful mint must not clear or replace the token"
         );
     }
 }
