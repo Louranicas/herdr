@@ -21,11 +21,29 @@ struct Isolated {
 
 impl Isolated {
     fn start(tag: &str) -> Self {
-        let base = std::env::temp_dir().join(format!(
-            "herdr-epoch-{tag}-{}-{}",
-            std::process::id(),
-            Instant::now().elapsed().as_nanos()
-        ));
+        // A UNIX socket path must fit in sockaddr_un.sun_path: 104 bytes on
+        // macOS, 108 on Linux. `std::env::temp_dir()` is `/var/folders/<2>/
+        // <28+>/T/` on macOS, so a descriptive base under it pushes the socket
+        // past the limit and the server dies with "path must be shorter than
+        // SUN_LEN" - which is what macOS CI reported. Build the root SHORT and
+        // assert it, rather than discovering the ceiling on one platform.
+        let root = if cfg!(unix) {
+            PathBuf::from("/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        // Short but collision-safe: pid plus a monotonic counter, so parallel
+        // tests in one process cannot collide and reruns cannot inherit a
+        // previous tree.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let short: String = tag
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(4)
+            .collect();
+        let base = root.join(format!("he{}-{}-{}", short, std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&base);
         for sub in ["config", "data", "state", "run"] {
             std::fs::create_dir_all(base.join(sub)).unwrap();
         }
@@ -36,6 +54,14 @@ impl Isolated {
         )
         .unwrap();
         let socket = base.join("run/herdr.sock");
+        // The assertion is the guard: without it this ceiling is only ever
+        // found by a platform that has it, and only in CI.
+        assert!(
+            socket.as_os_str().len() < 100,
+            "socket path {} is {} bytes; sockaddr_un.sun_path is 104 on macOS",
+            socket.display(),
+            socket.as_os_str().len()
+        );
 
         let mut me = Self {
             base,
