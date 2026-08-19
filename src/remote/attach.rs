@@ -1511,7 +1511,7 @@ fn preview_assets_for_build<'a>(
 /// network fetch. The override is what such a build needs, so the error names
 /// it.
 fn unpublished_channel_error(channel: &str) -> Option<String> {
-    if channel == "stable" || channel == "preview" {
+    if crate::build_info::is_published_channel(channel) {
         return None;
     }
     Some(format!(

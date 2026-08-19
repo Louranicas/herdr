@@ -4,9 +4,6 @@
 
 ### Added
 - `session.snapshot` and agent records now carry `server_epoch`, a non-persisted token identifying the server incarnation that answered, so a client can tell a live session from a replayed snapshot.
-
-### Fixed
-- A build on a channel that no published manifest describes no longer offers itself an upstream release. The update check compared only the bare package version, so such a build read as the plain version and any newer upstream release looked installable — updating would have replaced it with an unrelated binary. It now refuses before fetching anything and names `HERDR_UPDATE_SOURCE`, which supplies a manifest URL for that build's own channel.
 - Devin CLI, Cursor Agent CLI, MastraCode, Hermes Agent, and Grok CLI integrations now install and run natively on Windows.
 - Panes can now route normal right-click gestures to mouse-reporting applications through the pane menu, `herdr pane input`, `pane.input.set`, or the `pane split --right-click pane` launch option.
 - `theme.custom.sidebar_bg` can now give the desktop sidebar its own background without changing built-in theme defaults.
@@ -18,6 +15,7 @@
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 
 ### Fixed
+- A build on a channel that no published manifest describes no longer offers itself an upstream release. The update check compared only the bare package version, so such a build read as the plain version and any newer upstream release looked installable — updating would have replaced it with an unrelated binary. It now refuses before fetching anything and names `HERDR_UPDATE_SOURCE`, which supplies a manifest URL for that build's own channel.
 - The what's new modal now recognises release notes saved for a newer preview build, so it offers the update instead of presenting them as the running release.
 - Fish `Ctrl+Alt` keybindings now work in panes after legacy Alt-prefixed control bytes are decoded with both modifiers. (#2514)
 - `herdr config check` now reports unknown built-in theme names instead of silently accepting them. (#2452)

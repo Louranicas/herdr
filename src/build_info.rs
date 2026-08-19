@@ -24,6 +24,22 @@ pub fn is_preview() -> bool {
     channel() == "preview"
 }
 
+/// Whether a published release manifest describes builds on `channel`.
+///
+/// Herdr publishes exactly two manifests - the stable release manifest and the
+/// preview manifest - so a build stamped with any other channel appears in
+/// neither, and nothing upstream can resolve an update or a remote binary for
+/// it. Both refusals that depend on this fact live in other modules and must
+/// change together, so the rule is owned here rather than spelled out at each
+/// of them.
+///
+/// `channel` is a parameter rather than a call to [`channel()`] because that is
+/// a compile-time constant, so a caller's own channel could never exercise the
+/// other cases in a test.
+pub fn is_published_channel(channel: &str) -> bool {
+    matches!(channel, "stable" | "preview")
+}
+
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -37,6 +53,17 @@ fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// The two channels a published manifest describes, and the fact that
+    /// anything else is not one of them.
+    #[test]
+    fn only_stable_and_preview_are_published() {
+        assert!(super::is_published_channel("stable"));
+        assert!(super::is_published_channel("preview"));
+        assert!(!super::is_published_channel("heb"));
+        assert!(!super::is_published_channel(""));
+        assert!(!super::is_published_channel("Stable"));
+    }
+
     #[test]
     fn stable_version_defaults_to_cargo_version() {
         assert!(!super::version().is_empty());
