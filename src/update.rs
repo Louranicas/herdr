@@ -25,6 +25,11 @@ use serde::{Deserialize, Deserializer};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+/// A manifest URL for a build whose channel no published manifest describes.
+///
+/// Without this a fork has only two options, and both are wrong: never update,
+/// or update itself into an upstream binary.
+const FORK_UPDATE_SOURCE_ENV: &str = "HERDR_UPDATE_SOURCE";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
@@ -416,12 +421,60 @@ impl ReleaseInfo {
     }
 }
 
+/// An explicitly configured update source, if one is set and non-empty.
+fn fork_update_source() -> Option<String> {
+    env::var(FORK_UPDATE_SOURCE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Why a build on `channel` must not resolve an update from a published
+/// manifest, when that is the case.
+///
+/// The mirror of `remote::attach`'s refusal, for the opposite direction.
+/// Auto-install decides which binary to PUT on a remote host; this decides
+/// which binary to REPLACE THIS ONE WITH, so getting it wrong is worse: a fork
+/// silently updates itself into upstream and the fork's changes are gone.
+///
+/// The leak was not in a channel comparison but in the version one.
+/// `Version::current()` parses `BASE_VERSION`, which is the bare package
+/// version with the channel suffix already discarded - so a `0.8.0-heb.1`
+/// build compares as plain `0.8.0`, upstream `0.8.1` reads as strictly newer,
+/// and the update is offered. Nothing in that path ever sees `heb`.
+///
+/// `channel` is a parameter rather than a call to `build_info::channel()`
+/// because that is a compile-time constant: on this fork it is always `heb`,
+/// so a test could never exercise the stable or preview cases.
+fn unpublished_channel_update_refusal(channel: &str, fork_source: Option<&str>) -> Option<String> {
+    if channel == "stable" || channel == "preview" {
+        return None;
+    }
+    if fork_source.is_some_and(|source| !source.trim().is_empty()) {
+        return None;
+    }
+    Some(format!(
+        "this herdr is built on the `{channel}` channel, which no published release manifest describes, so updating from one would replace this build with an unrelated upstream binary; set {FORK_UPDATE_SOURCE_ENV} to a manifest URL for this build's own channel, or update it the way it was installed"
+    ))
+}
+
+/// The manifest a published channel uses, or the configured fork source.
+///
+/// A configured source REPLACES the upstream URL rather than merely unlocking
+/// it. Letting the escape hatch fall through to `herdr.dev` would reopen the
+/// leak behind a flag, which is worse than having no escape hatch at all -
+/// the operator would have asked for their own source and silently got
+/// upstream's.
+fn manifest_url(published: &str) -> String {
+    fork_update_source().unwrap_or_else(|| published.to_string())
+}
+
 fn fetch_update_manifest() -> Result<UpdateManifest, String> {
-    fetch_json_manifest(STABLE_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(&manifest_url(STABLE_UPDATE_MANIFEST_URL))
 }
 
 fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
-    fetch_json_manifest(PREVIEW_UPDATE_MANIFEST_URL)
+    fetch_json_manifest(&manifest_url(PREVIEW_UPDATE_MANIFEST_URL))
 }
 
 fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
@@ -605,6 +658,17 @@ fn release_info_from_preview_manifest(
 
 /// Check the hosted update manifest for the latest release. Returns release info if newer.
 fn check_latest() -> Result<Option<ReleaseInfo>, String> {
+    // Before either fetch. Refusing afterwards would spend a network round
+    // trip to learn something knowable from the running binary alone, and
+    // would report the fork's own absence from the manifest as if the manifest
+    // were at fault.
+    if let Some(message) = unpublished_channel_update_refusal(
+        crate::build_info::channel(),
+        fork_update_source().as_deref(),
+    ) {
+        return Err(message);
+    }
+
     let channel = UpdateChannel::configured();
     if channel == UpdateChannel::Preview {
         return release_info_from_preview_manifest(&fetch_preview_manifest()?);
@@ -3651,6 +3715,80 @@ mod tests {
 
         assert_eq!(release.version, Version::parse("99.99.99").unwrap());
         assert_eq!(release.download_url, "https://example.com/herdr");
+    }
+
+    /// The two channels that publish a manifest update normally.
+    #[test]
+    fn published_channels_resolve_updates_from_their_manifest() {
+        assert_eq!(unpublished_channel_update_refusal("stable", None), None);
+        assert_eq!(unpublished_channel_update_refusal("preview", None), None);
+    }
+
+    /// The defect: a fork build offered an upstream release.
+    ///
+    /// `Version::current()` discards the channel suffix, so `0.8.0-heb.1`
+    /// compares as `0.8.0` and upstream `0.8.1` reads as strictly newer. The
+    /// refusal has to come from the channel, because the version comparison
+    /// cannot see the problem.
+    #[test]
+    fn an_unpublished_channel_refuses_to_update_from_a_published_manifest() {
+        let message = unpublished_channel_update_refusal("heb", None)
+            .expect("an unpublished channel must refuse to self-update");
+        assert!(
+            message.contains("heb"),
+            "the message must name the channel: {message}"
+        );
+        assert!(
+            message.contains(FORK_UPDATE_SOURCE_ENV),
+            "the message must name the way out: {message}"
+        );
+
+        // The version comparison this refusal exists to override: without it,
+        // a newer upstream release is judged installable on a fork build.
+        let fork_as_the_comparison_sees_it =
+            Version::parse(crate::build_info::BASE_VERSION).expect("base version parses");
+        let upstream = Version::parse("0.8.1").expect("parses");
+        assert!(
+            stable_channel_should_install(&upstream, &fork_as_the_comparison_sees_it, false),
+            "this asserts the hazard is real; if it ever stops holding, the \
+             refusal is still correct but this test no longer explains why"
+        );
+    }
+
+    /// This fork stamps an unpublished channel, so the refusal is the path
+    /// every build on this branch actually takes.
+    #[test]
+    fn this_fork_refuses_to_self_update() {
+        assert!(
+            unpublished_channel_update_refusal(crate::build_info::channel(), None).is_some(),
+            "channel {:?} would self-update from a published manifest",
+            crate::build_info::channel()
+        );
+    }
+
+    /// The escape hatch must point at what was configured.
+    ///
+    /// Allowing the refusal to lift while still fetching `herdr.dev` would be
+    /// the same leak behind a flag - and a worse one, because the operator
+    /// asked for their own source and would silently receive upstream's.
+    #[test]
+    fn a_configured_fork_source_is_used_instead_of_upstream() {
+        assert_eq!(
+            unpublished_channel_update_refusal("heb", Some("https://example.invalid/fork.json")),
+            None,
+            "an explicitly configured source must lift the refusal"
+        );
+        assert_eq!(
+            unpublished_channel_update_refusal("heb", Some("   ")),
+            unpublished_channel_update_refusal("heb", None),
+            "a blank source is not a configured source"
+        );
+        // Unset: the published URL is used unchanged.
+        assert_eq!(
+            manifest_url(STABLE_UPDATE_MANIFEST_URL),
+            STABLE_UPDATE_MANIFEST_URL,
+            "with no configured source the published manifest must be used"
+        );
     }
 
     #[test]
