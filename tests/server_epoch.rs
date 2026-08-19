@@ -149,6 +149,42 @@ impl Isolated {
             .to_string()
     }
 
+    /// The label of the first workspace the snapshot reports.
+    ///
+    /// Read alongside the pane id so a restart can be shown to have RESTORED
+    /// the saved session rather than started an empty one: a fresh server also
+    /// serves `w1:p1`, so pane identity alone cannot tell the two apart, while
+    /// a label nobody typed twice can.
+    fn first_workspace_label(&self) -> String {
+        let raw = self.run(&["api", "snapshot"]);
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["result"]["snapshot"]["workspaces"][0]["label"]
+            .as_str()
+            .expect("a workspace exists")
+            .to_string()
+    }
+
+    /// Stop the owned server and start another against the SAME isolated tree,
+    /// so the successor restores the session the first one persisted.
+    ///
+    /// A plain restart, not `live-handoff`: the two are different paths - one
+    /// passes the listening socket to a successor process, the other exits and
+    /// lets a later process read the session back off disk - and only this one
+    /// is what a user does when they reboot or run `herdr server stop`.
+    fn restart(&mut self) {
+        let stop = self.cmd(&["server", "stop"]).output().unwrap();
+        assert!(
+            stop.status.success(),
+            "server stop failed: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        if let Some(mut previous) = self.server.take() {
+            let _ = previous.wait();
+        }
+        self.server = Some(self.cmd(&["server"]).spawn().unwrap());
+        self.wait_until_serving();
+    }
+
     /// PIDs of servers belonging to THIS socket.
     ///
     /// `/proc/<pid>/environ` is a Linux interface. On other platforms this
@@ -317,6 +353,44 @@ fn a_failed_handoff_retains_the_token() {
     assert_eq!(
         before, after,
         "a failed handoff must not rotate the token: nothing was replaced"
+    );
+}
+
+/// The case the field exists for, end to end: a restart REPLAYS the saved
+/// session, so everything describing it comes back identical and a client
+/// comparing that metadata cannot tell the restored session from the one it
+/// recorded. The incarnation token is the one thing that differs.
+///
+/// Distinct from the handoff case above, which exercises the socket-passing
+/// path. This one exercises the ordinary path - the server exits, a later
+/// process reads the session back off disk - and would keep passing if
+/// rotation were ever made a property of handoff alone.
+#[test]
+fn a_restart_replays_the_saved_session_but_not_the_incarnation() {
+    let mut iso = Isolated::start("replay");
+    iso.run(&["workspace", "create", "--label", "replayed", "--focus"]);
+    let pane_before = iso.first_pane();
+    let label_before = iso.first_workspace_label();
+    let before = iso.snapshot_epoch().expect("token before the restart");
+    assert_eq!(label_before, "replayed", "the label under test must be set");
+
+    iso.restart();
+
+    // The session really was restored, so the comparison below is between two
+    // servers serving the SAME session rather than between a session and an
+    // empty one.
+    assert_eq!(
+        (iso.first_workspace_label(), iso.first_pane()),
+        (label_before, pane_before),
+        "the restart must replay the saved session, or this proves nothing"
+    );
+
+    let after = iso.snapshot_epoch().expect("token after the restart");
+    assert!(is_lower_hex_32(&after), "not 128 bits of hex: {after}");
+    assert_ne!(
+        before, after,
+        "a restart is a new incarnation: a client holding the old token must be able to tell, \
+         even though every other field it could compare is identical"
     );
 }
 
