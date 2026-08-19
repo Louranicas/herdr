@@ -30,7 +30,18 @@ import unittest
 from pathlib import Path
 
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/preview.yml"
-UPSTREAM = "ogulcancelik/herdr"
+# The CANONICAL upstream repository. `github.repository` reports the canonical
+# `owner/name` at run time, never a redirect alias, so a guard naming an alias
+# is false in EVERY repository - upstream included. That reads like a guard and
+# behaves like a kill switch: it would silently stop upstream publishing while
+# looking exactly like a working fork guard.
+UPSTREAM = "herdrdev/herdr"
+
+# Redirect aliases this repository has answered to. GitHub keeps serving them
+# after a rename, so `git remote -v` and old links still show them long after
+# they stopped being what Actions reports.
+KNOWN_ALIASES = frozenset({"ogulcancelik/herdr"})
+
 # The repository this branch is delivered to. The guard must be FALSE here.
 FORK = "Louranicas/herdr"
 
@@ -139,11 +150,7 @@ class PreviewForkGuard(unittest.TestCase):
         """
         for name, condition in self.jobs.items():
             condition = str(condition)
-            # The guard's own clause, isolated from any `&&` conjunction.
-            clause = next(
-                (c.strip() for c in condition.split("&&") if "github.repository" in c),
-                None,
-            )
+            clause = _repository_clause(condition)
             self.assertIsNotNone(clause, f"job {name!r} has no repository clause")
             self.assertFalse(
                 clause.lstrip().startswith("!"),
@@ -161,6 +168,29 @@ class PreviewForkGuard(unittest.TestCase):
             self.assertFalse(
                 _evaluate(clause, FORK),
                 f"job {name!r} guard is TRUE for {FORK}; this fork would publish",
+            )
+
+    def test_the_guard_does_not_name_a_redirect_alias(self) -> None:
+        """A guard naming a stale alias is false upstream too.
+
+        `ogulcancelik/herdr` still resolves - GitHub honours the redirect - so
+        the name looks live in a browser and in `git remote -v` while
+        `github.repository` reports `herdrdev/herdr`. Equality against the
+        alias therefore never holds anywhere, which disables publishing rather
+        than restricting it. Asserting the fork case alone would not catch
+        this: a guard that is false everywhere is false for the fork too.
+        """
+        for name, condition in self.jobs.items():
+            clause = _repository_clause(str(condition))
+            self.assertIsNotNone(clause, f"job {name!r} has no repository clause")
+            _, _, right = str(clause).partition("==")
+            named = right.strip().strip("'\"")
+            self.assertNotIn(
+                named,
+                KNOWN_ALIASES,
+                f"job {name!r} guards on the redirect alias {named!r}; "
+                f"`github.repository` reports {UPSTREAM!r}, so this condition "
+                f"is false in every repository and publishes nowhere",
             )
 
     def test_the_scanner_understood_the_expected_jobs(self) -> None:
@@ -187,6 +217,14 @@ class PreviewForkGuard(unittest.TestCase):
             "this workflow no longer stamps `preview`; revisit the fork guard "
             "rather than leaving a guard whose reason has gone",
         )
+
+
+def _repository_clause(condition: str) -> str | None:
+    """The guard's own clause, isolated from any `&&` conjunction."""
+    return next(
+        (c.strip() for c in condition.split("&&") if "github.repository" in c),
+        None,
+    )
 
 
 def _evaluate(clause: str, repository: str) -> bool:

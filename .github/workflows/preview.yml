@@ -34,7 +34,7 @@ concurrency:
 jobs:
   preflight:
     # FORK GUARD: false on any repository but upstream.
-    if: github.repository == 'ogulcancelik/herdr'
+    if: github.repository == 'herdrdev/herdr'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -133,7 +133,7 @@ jobs:
   build:
     needs: preflight
     # FORK GUARD: false on any repository but upstream.
-    if: github.repository == 'ogulcancelik/herdr' && needs.preflight.outputs.should_publish == 'true'
+    if: github.repository == 'herdrdev/herdr' && needs.preflight.outputs.should_publish == 'true'
     permissions:
       contents: read
     strategy:
@@ -300,7 +300,7 @@ jobs:
   publish:
     needs: [preflight, build]
     # FORK GUARD: false on any repository but upstream.
-    if: github.repository == 'ogulcancelik/herdr' && needs.preflight.outputs.should_publish == 'true'
+    if: github.repository == 'herdrdev/herdr' && needs.preflight.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: docs-publish-master

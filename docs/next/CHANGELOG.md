@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- `session.snapshot` and agent records now carry `server_epoch`, a non-persisted token identifying the server incarnation that answered, so a client can tell a live session from a replayed snapshot.
 - Devin CLI, Cursor Agent CLI, MastraCode, Hermes Agent, and Grok CLI integrations now install and run natively on Windows.
 - Panes can now route normal right-click gestures to mouse-reporting applications through the pane menu, `herdr pane input`, `pane.input.set`, or the `pane split --right-click pane` launch option.
 - `theme.custom.sidebar_bg` can now give the desktop sidebar its own background without changing built-in theme defaults.

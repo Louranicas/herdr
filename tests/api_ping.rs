@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
+    cleanup_test_base, expected_version, register_runtime_dir, register_spawned_herdr_pid,
     unregister_spawned_herdr_pid,
 };
 
@@ -284,32 +284,6 @@ fn event_by_kind<'a>(events: &'a [serde_json::Value], kind: &str) -> &'a serde_j
         .unwrap_or_else(|| panic!("missing event {kind}"))
 }
 
-/// The version the running binary reports, recomposed from the SAME
-/// compile-time inputs `build_info::version()` uses.
-///
-/// Not a second subprocess: `spawn_herdr` and this test crate are both built
-/// from `CARGO_BIN_EXE_herdr`, so comparing one against the other compares a
-/// constant with itself and cannot fail. Cargo's `[env]` applies to rustc for
-/// this crate too, so the composition here sees exactly what the binary saw -
-/// which keeps the assertion exact on a stock build AND on a forked one,
-/// instead of trading a real check for a tautology.
-fn expected_version() -> String {
-    let channel = option_env!("HERDR_BUILD_CHANNEL")
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .unwrap_or("stable");
-    if channel == "stable" {
-        return env!("CARGO_PKG_VERSION").to_string();
-    }
-    match option_env!("HERDR_BUILD_ID")
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-    {
-        Some(build_id) => format!("{}-{channel}.{build_id}", env!("CARGO_PKG_VERSION")),
-        None => format!("{}-{channel}", env!("CARGO_PKG_VERSION")),
-    }
-}
-
 #[test]
 fn ping_over_socket_returns_version() {
     let _lock = test_lock();
@@ -336,7 +310,8 @@ fn ping_over_socket_returns_version() {
     // Exact, not merely self-consistent: a recomposition that happened to
     // produce the stock string would still match itself.
     assert_eq!(
-        value["result"]["version"], "0.8.0-heb.1",
+        value["result"]["version"],
+        concat!(env!("CARGO_PKG_VERSION"), "-heb.1"),
         "ping must serve the fork identity"
     );
     assert!(

@@ -1,31 +1,5 @@
 use super::harness::*;
 
-/// The version the running binary reports, recomposed from the SAME
-/// compile-time inputs `build_info::version()` uses.
-///
-/// Not a second subprocess: `spawn_herdr` and this test crate are both built
-/// from `CARGO_BIN_EXE_herdr`, so comparing one against the other compares a
-/// constant with itself and cannot fail. Cargo's `[env]` applies to rustc for
-/// this crate too, so the composition here sees exactly what the binary saw -
-/// which keeps the assertion exact on a stock build AND on a forked one,
-/// instead of trading a real check for a tautology.
-fn expected_version() -> String {
-    let channel = option_env!("HERDR_BUILD_CHANNEL")
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .unwrap_or("stable");
-    if channel == "stable" {
-        return env!("CARGO_PKG_VERSION").to_string();
-    }
-    match option_env!("HERDR_BUILD_ID")
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-    {
-        Some(build_id) => format!("{}-{channel}.{build_id}", env!("CARGO_PKG_VERSION")),
-        None => format!("{}-{channel}", env!("CARGO_PKG_VERSION")),
-    }
-}
-
 #[test]
 fn named_sessions_use_separate_servers_and_workspace_state() {
     let base = unique_test_dir();
@@ -481,7 +455,8 @@ fn status_commands_report_client_and_server_versions() {
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], expected_version());
     assert_eq!(
-        full_json["client"]["version"], "0.8.0-heb.1",
+        full_json["client"]["version"],
+        concat!(env!("CARGO_PKG_VERSION"), "-heb.1"),
         "status must report the fork identity"
     );
     assert_eq!(full_json["client"]["protocol"], 20);
@@ -499,7 +474,8 @@ fn status_commands_report_client_and_server_versions() {
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], expected_version());
     assert_eq!(
-        server_json["version"], "0.8.0-heb.1",
+        server_json["version"],
+        concat!(env!("CARGO_PKG_VERSION"), "-heb.1"),
         "the server must report the fork identity"
     );
     assert_eq!(server_json["protocol"], 20);
