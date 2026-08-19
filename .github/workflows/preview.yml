@@ -20,6 +20,12 @@ name: Preview
 # this file and fails if any job loses it.
 on:
   workflow_dispatch:
+    inputs:
+      commit:
+        description: Optional master commit SHA to publish
+        required: false
+        type: string
+
 permissions:
   contents: read
 

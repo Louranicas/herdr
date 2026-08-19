@@ -2835,7 +2835,7 @@ mod tests {
         let path = temp_config_path("startup-pending-release-notes-no-auto-open");
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
 
-        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
+        crate::release_notes::save_pending(&crate::build_info::version(), "### Changed\n- One")
             .unwrap();
         let config = Config {
             onboarding: Some(false),
@@ -2862,7 +2862,7 @@ mod tests {
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
         std::env::set_var("XDG_STATE_HOME", &state_home);
 
-        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- One")
+        crate::release_notes::save_pending(&crate::build_info::version(), "### Changed\n- One")
             .unwrap();
         crate::product_announcements::save_manifest_announcement(
             &crate::build_info::version(),

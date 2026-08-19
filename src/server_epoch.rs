@@ -42,16 +42,6 @@ impl std::fmt::Display for EntropyUnavailable {
 
 impl std::error::Error for EntropyUnavailable {}
 
-/// Mint the token for this process. Call ONCE at server startup, before any
-/// API response can be served.
-///
-/// Deliberately eager rather than lazy. Minting on first `agent get` would
-/// move a fallible OS call into response construction, where there is no
-/// honest way to fail — the caller would get either a made-up token or a
-/// panic, and a made-up token is the exact thing this exists to prevent.
-/// Failing here means the server does not start, which is the correct
-/// outcome: an incarnation token that cannot be trusted is worse than a
-/// server that says why it stopped.
 /// Draw one token. Separated from `init` so the unguessability property has
 /// something to test: with the value hidden behind a `OnceLock`, a test calling
 /// `init` twice can only observe that the cell did not change - which is a
@@ -69,6 +59,16 @@ fn mint() -> Result<String, EntropyUnavailable> {
         }))
 }
 
+/// Mint the token for this process. Call ONCE at server startup, before any
+/// API response can be served.
+///
+/// Deliberately eager rather than lazy. Minting on first `agent get` would
+/// move a fallible OS call into response construction, where there is no
+/// honest way to fail — the caller would get either a made-up token or a
+/// panic, and a made-up token is the exact thing this exists to prevent.
+/// Failing here means the server does not start, which is the correct
+/// outcome: an incarnation token that cannot be trusted is worse than a
+/// server that says why it stopped.
 pub fn init() -> Result<(), EntropyUnavailable> {
     // Already minted: return success without touching the RNG. Drawing again
     // would let a second call FAIL over a token that is present and perfectly

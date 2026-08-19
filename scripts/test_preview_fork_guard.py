@@ -72,16 +72,42 @@ def _strip_comment(line: str) -> str:
     return "".join(out).rstrip()
 
 
+def _unquote(value: str) -> str:
+    """Drop one matched pair of surrounding quotes, if present."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _mapping_entry(body: str) -> tuple[str, str]:
+    """A scalar `key: value` entry, or a refusal.
+
+    An entry with no value opens a nested block, which this scanner does not
+    model. Returning an empty string for it would hand back a confident wrong
+    answer about what the workflow sets.
+    """
+    key, separator, value = body.partition(":")
+    if not separator:
+        raise WorkflowShapeError(f"not a `key: value` entry: {body!r}")
+    value = value.strip()
+    if not value:
+        raise WorkflowShapeError(f"nested mapping under {key.strip()!r} is not modelled")
+    return _unquote(key.strip()), _unquote(value)
+
+
 def scan() -> dict:
-    """A deliberately small model: top-level trigger keys, and job -> `if`."""
+    """A deliberately small model: top-level trigger keys, workflow-level
+    `env`, and per job its `if` and its job-level `env`."""
     text = WORKFLOW.read_text()
     if "\t" in text:
         raise WorkflowShapeError("tab in the workflow; this scanner models spaces only")
 
     triggers: list[str] = []
-    jobs: dict[str, str | None] = {}
+    workflow_env: dict[str, str] = {}
+    jobs: dict[str, dict] = {}
     section = None
     current_job = None
+    in_job_env = False
 
     for raw in text.split("\n"):
         line = _strip_comment(raw)
@@ -91,27 +117,50 @@ def scan() -> dict:
         body = line.strip()
 
         if indent == 0:
-            # `on:` is the trigger block; `jobs:` opens the job map.
+            # `on:` is the trigger block; `jobs:` opens the job map; `env:` is
+            # the workflow-wide environment every job inherits.
             section = "on" if body in ("on:", '"on":', "'on':") else (
-                "jobs" if body == "jobs:" else None
+                "jobs" if body == "jobs:" else ("env" if body == "env:" else None)
             )
             current_job = None
+            in_job_env = False
             continue
 
         if section == "on" and indent == 2 and body.endswith(":"):
             triggers.append(body[:-1].strip().strip("\"'"))
+        elif section == "env" and indent == 2:
+            key, value = _mapping_entry(body)
+            workflow_env[key] = value
         elif section == "jobs" and indent == 2 and body.endswith(":"):
             current_job = body[:-1].strip().strip("\"'")
-            jobs[current_job] = None
-        elif section == "jobs" and indent == 4 and current_job and body.startswith("if:"):
-            value = body[len("if:"):].strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            jobs[current_job] = value
+            jobs[current_job] = {"if": None, "env": {}}
+            in_job_env = False
+        elif section == "jobs" and indent == 4 and current_job:
+            # Only a key at JOB level opens the job's own `env`; the `env:` of
+            # a step lives deeper and governs that step alone.
+            in_job_env = body == "env:"
+            if body.startswith("if:"):
+                jobs[current_job]["if"] = _unquote(body[len("if:"):].strip())
+        elif section == "jobs" and indent == 6 and current_job and in_job_env:
+            key, value = _mapping_entry(body)
+            jobs[current_job]["env"][key] = value
 
     if not jobs:
         raise WorkflowShapeError("no jobs found; the scanner did not understand this file")
-    return {"triggers": triggers, "jobs": jobs}
+    return {"triggers": triggers, "env": workflow_env, "jobs": jobs}
+
+
+def job_env(doc: dict, job: str, name: str) -> str | None:
+    """The value a step in `job` would see for `name`.
+
+    Job-level `env` wins over the workflow-level `env` it inherits, which is
+    what GitHub Actions does - so a policy that moves between those two levels
+    without changing meaning still reads the same here.
+    """
+    entry = doc["jobs"][job]
+    if name in entry["env"]:
+        return entry["env"][name]
+    return doc["env"].get(name)
 
 
 class PreviewForkGuard(unittest.TestCase):
@@ -131,7 +180,8 @@ class PreviewForkGuard(unittest.TestCase):
 
     def test_every_job_carries_the_repository_guard(self) -> None:
         """At JOB level, so it governs the whole job rather than one step."""
-        for name, condition in self.jobs.items():
+        for name, job in self.jobs.items():
+            condition = job["if"]
             self.assertIsNotNone(
                 condition,
                 f"job {name!r} has no `if`: a manual run would execute it on any fork",
@@ -148,8 +198,8 @@ class PreviewForkGuard(unittest.TestCase):
         A guard naming the wrong repository, or negated, would still contain the
         upstream string and pass a substring check.
         """
-        for name, condition in self.jobs.items():
-            condition = str(condition)
+        for name, job in self.jobs.items():
+            condition = str(job["if"])
             clause = _repository_clause(condition)
             self.assertIsNotNone(clause, f"job {name!r} has no repository clause")
             self.assertFalse(
@@ -180,8 +230,8 @@ class PreviewForkGuard(unittest.TestCase):
         than restricting it. Asserting the fork case alone would not catch
         this: a guard that is false everywhere is false for the fork too.
         """
-        for name, condition in self.jobs.items():
-            clause = _repository_clause(str(condition))
+        for name, job in self.jobs.items():
+            clause = _repository_clause(str(job["if"]))
             self.assertIsNotNone(clause, f"job {name!r} has no repository clause")
             _, _, right = str(clause).partition("==")
             named = right.strip().strip("'\"")
@@ -201,6 +251,12 @@ class PreviewForkGuard(unittest.TestCase):
             {"preflight", "build", "publish"},
             f"scanner produced {sorted(self.jobs)}; the model does not match the file",
         )
+        # An `env` model that quietly collapsed to nothing would make the stamp
+        # assertion fail for a reason that has nothing to do with the workflow.
+        self.assertTrue(self.doc["env"], "scanner read no workflow-level `env`")
+        self.assertTrue(
+            self.jobs["build"]["env"], "scanner read no job-level `env` for `build`"
+        )
 
     def test_the_workflow_still_stamps_preview(self) -> None:
         """The reason the guard exists.
@@ -209,12 +265,16 @@ class PreviewForkGuard(unittest.TestCase):
         be gone and the guard could be reconsidered. Until then it must stay,
         and this records why — so a future reader does not remove the guard
         without noticing what it was protecting against.
+
+        Asserted on the parsed model, in the environment the compiling job
+        actually sees. A substring search over the file would pass on a
+        commented-out line and fail on a stamp that merely moved from the job
+        to the workflow, which changes nothing about what gets built.
         """
-        text = WORKFLOW.read_text()
-        self.assertIn(
-            "HERDR_BUILD_CHANNEL: preview",
-            text,
-            "this workflow no longer stamps `preview`; revisit the fork guard "
+        self.assertEqual(
+            job_env(self.doc, "build", "HERDR_BUILD_CHANNEL"),
+            "preview",
+            "the build job no longer stamps `preview`; revisit the fork guard "
             "rather than leaving a guard whose reason has gone",
         )
 

@@ -56,7 +56,7 @@ mod tests {
         assert_eq!(super::build_id(), Some("1"));
         assert_eq!(
             super::version(),
-            "0.8.0-heb.1",
+            concat!(env!("CARGO_PKG_VERSION"), "-heb.1"),
             "the fork must report its own identity, never stock"
         );
         assert_ne!(super::version(), super::BASE_VERSION);

@@ -503,7 +503,7 @@ pub(crate) fn mint_server_epoch_or_exit() {
         // and then a generic "the background server may still be starting",
         // pointing at a log containing nothing. A server that cannot say why
         // it stopped is the thing this refusal exists to avoid.
-        tracing::error!("cannot mint the server incarnation token: {err}");
+        tracing::error!("{err}");
         eprintln!("error: {err}");
         // EX_UNAVAILABLE: a required service - the OS entropy source - is not
         // available. Not EX_SOFTWARE, which would blame the program for an

@@ -47,12 +47,17 @@ impl Isolated {
         for sub in ["config", "data", "state", "run"] {
             std::fs::create_dir_all(base.join(sub)).unwrap();
         }
-        std::fs::create_dir_all(base.join("config/herdr")).unwrap();
-        std::fs::write(
-            base.join("config/herdr/config.toml"),
-            "onboarding = false\n",
-        )
-        .unwrap();
+        // Both spellings: the app directory is `herdr` for a release build and
+        // `herdr-dev` for a debug one, so writing only the first left this
+        // setting unread on the profile the suite actually runs under.
+        for app_dir in ["herdr", "herdr-dev"] {
+            std::fs::create_dir_all(base.join("config").join(app_dir)).unwrap();
+            std::fs::write(
+                base.join("config").join(app_dir).join("config.toml"),
+                "onboarding = false\n",
+            )
+            .unwrap();
+        }
         let socket = base.join("run/herdr.sock");
         // The assertion is the guard: without it this ceiling is only ever
         // found by a platform that has it, and only in CI.
@@ -69,7 +74,7 @@ impl Isolated {
             server: None,
         };
         me.server = Some(me.cmd(&["server"]).spawn().unwrap());
-        me.wait_for_socket();
+        me.wait_until_serving();
         me
     }
 
@@ -94,15 +99,27 @@ impl Isolated {
         String::from_utf8_lossy(&out.stdout).to_string()
     }
 
-    fn wait_for_socket(&self) {
+    /// Wait until the server ANSWERS, and return the token it answered with.
+    ///
+    /// Not "until the socket file exists": `bind` creates that path before the
+    /// listener is accepting, and the api client connects once without
+    /// retrying, so the next command can still be refused. After a handoff the
+    /// existence check is weaker still - the successor has to rebind the path
+    /// the old server removed, so a file check can return before any server is
+    /// listening at all.
+    fn wait_until_serving(&self) -> String {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            if self.socket.exists() {
-                return;
+        loop {
+            if let Some(epoch) = self.snapshot_epoch() {
+                return epoch;
             }
+            assert!(
+                Instant::now() < deadline,
+                "no server answered on {}",
+                self.socket.display()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("server socket never appeared at {}", self.socket.display());
     }
 
     /// The token as the SNAPSHOT reports it.
@@ -253,10 +270,10 @@ fn a_successful_handoff_rotates_the_token() {
         "handoff failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::thread::sleep(Duration::from_millis(1500));
-    iso.wait_for_socket();
-
-    let after = iso.snapshot_epoch().expect("token after handoff");
+    // The old server removes the public socket before it answers this command,
+    // so the successor has to rebind it. Waiting for an ANSWER waits for that;
+    // a fixed sleep would only have made the window likely rather than closed.
+    let after = iso.wait_until_serving();
     assert_ne!(before, after, "a handoff must rotate the token");
     assert!(is_lower_hex_32(&after));
     // Process proof only where /proc exists. Elsewhere the rotation above is
@@ -446,7 +463,8 @@ fn the_binary_reports_the_fork_identity_on_both_version_flags() {
         assert!(out.status.success(), "{flag} exited non-zero");
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert_eq!(
-            text, "herdr 0.8.0-heb.1",
+            text,
+            concat!("herdr ", env!("CARGO_PKG_VERSION"), "-heb.1"),
             "{flag} must print the fork identity exactly, not stock"
         );
     }
