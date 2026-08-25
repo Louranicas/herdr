@@ -21,6 +21,16 @@ struct Isolated {
 
 impl Isolated {
     fn start(tag: &str) -> Self {
+        let mut me = Self::prepare(tag);
+        me.spawn_server();
+        me
+    }
+
+    /// The isolated tree WITHOUT a running server. The entropy-failure test
+    /// needs this: it must control the server's environment (`LD_PRELOAD`)
+    /// and observe its exit, neither of which a constructor that already
+    /// started the process would allow.
+    fn prepare(tag: &str) -> Self {
         // A UNIX socket path must fit in sockaddr_un.sun_path: 104 bytes on
         // macOS, 108 on Linux. `std::env::temp_dir()` is `/var/folders/<2>/
         // <28+>/T/` on macOS, so a descriptive base under it pushes the socket
@@ -68,14 +78,62 @@ impl Isolated {
             socket.as_os_str().len()
         );
 
-        let mut me = Self {
+        Self {
             base,
             socket,
             server: None,
-        };
-        me.server = Some(me.cmd(&["server"]).spawn().unwrap());
-        me.wait_until_serving();
-        me
+        }
+    }
+
+    fn spawn_server(&mut self) {
+        assert!(
+            self.server.is_none(),
+            "a server is already owned; stop it before starting another"
+        );
+        self.server = Some(self.cmd(&["server"]).spawn().unwrap());
+        // Wait until the server actually ANSWERS, not merely until the socket
+        // file exists: `bind` creates the path before the listener accepts, and
+        // after a restart the successor must rebind the path the old server
+        // removed, so a file check can return before anything is listening.
+        self.wait_until_serving();
+    }
+
+    /// Stop the owned server and wait until it has actually exited.
+    ///
+    /// The same discipline as the persistence test: `stop` must SUCCEED and
+    /// the process must be GONE, proven via `/proc` where it exists and via
+    /// the socket disappearing elsewhere. A restart layered on a fixed sleep
+    /// could race the old process and read the OLD incarnation as the new
+    /// one, making rotation look broken — or worse, not look at all.
+    fn stop_and_wait(&mut self) {
+        let stop = self.cmd(&["server", "stop"]).output().unwrap();
+        assert!(
+            stop.status.success(),
+            "server stop failed: {}",
+            String::from_utf8_lossy(&stop.stderr)
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match self.server_pids() {
+                Some(p) if p.is_empty() => break,
+                // Where /proc is unavailable, fall back to the socket
+                // disappearing — the same fallback the persistence test uses.
+                None if !self.socket.exists() => break,
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the owned server did not exit after a successful stop"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if let Some(mut c) = self.server.take() {
+            let _ = c.wait();
+        }
+        // Clear the stale socket FILE the exited server may have left, so the
+        // next `spawn_server` rebinds a clean path before `wait_until_serving`
+        // begins probing for an answer.
+        let _ = std::fs::remove_file(&self.socket);
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -391,6 +449,206 @@ fn a_restart_replays_the_saved_session_but_not_the_incarnation() {
         before, after,
         "a restart is a new incarnation: a client holding the old token must be able to tell, \
          even though every other field it could compare is identical"
+    );
+}
+
+/// A RESTART must rotate the token across real process boundaries: two
+/// sequential server processes over the same state directory mint different
+/// tokens. The unit test `independent_mints_differ` proves two draws differ
+/// inside ONE process — a mint derived from anything stable across restarts
+/// (state-dir contents, hostname, socket path) would pass it while restarts
+/// kept presenting the same token, which is exactly the staleness a consumer
+/// could then never detect. Only a second process can pin this.
+#[test]
+fn a_new_server_process_over_the_same_state_dir_mints_a_different_token() {
+    let mut iso = Isolated::start("xproc");
+    let first = iso.snapshot_epoch().expect("token from the first process");
+    assert!(is_lower_hex_32(&first), "not 128 bits of hex: {first}");
+    let pids_first = iso.server_pids();
+
+    iso.stop_and_wait();
+    iso.spawn_server();
+
+    let second = iso.snapshot_epoch().expect("token from the second process");
+    assert!(is_lower_hex_32(&second), "not 128 bits of hex: {second}");
+    assert_ne!(
+        first, second,
+        "a fresh server process over the same state dir must mint a fresh token"
+    );
+    // Process proof only where /proc exists — the same corroboration split as
+    // the handoff test: rotation is asserted everywhere, replacement is
+    // proven where it can be and skipped out loud where it cannot.
+    match (pids_first, iso.server_pids()) {
+        (Some(before), Some(after)) => assert_ne!(
+            before, after,
+            "the token rotated, so a different process must be serving it"
+        ),
+        _ => eprintln!("process-replacement proof skipped: /proc is Linux-only"),
+    }
+}
+
+/// N CONCURRENT `agent get` reads must agree on ONE token. One incarnation is
+/// one value; if parallel readers could disagree — a per-response mint, a
+/// per-connection value — then two consumers comparing notes would see a
+/// handoff that never happened. Twelve parallel readers, matching the
+/// r18-server-epoch drill; every reader must produce a value, because a
+/// missing read compared against nothing passes vacuously.
+#[test]
+fn concurrent_agent_get_reads_agree_on_one_token() {
+    let iso = Isolated::start("conc");
+    iso.run(&["workspace", "create", "--label", "conc", "--focus"]);
+    let pane = iso.first_pane();
+    iso.run(&[
+        "pane",
+        "report-agent",
+        &pane,
+        "--source",
+        "epoch-test",
+        "--agent",
+        "claude",
+        "--state",
+        "idle",
+    ]);
+    let reference = iso
+        .agent_epoch(&pane)
+        .expect("agent info carries the token");
+    assert!(
+        is_lower_hex_32(&reference),
+        "not 128 bits of hex: {reference}"
+    );
+
+    // Commands are built up front and MOVED into the reader threads, so every
+    // thread runs the same invocation an ordinary client would.
+    const READERS: usize = 12;
+    let commands: Vec<Command> = (0..READERS)
+        .map(|_| iso.cmd(&["agent", "get", &pane]))
+        .collect();
+    let values: Vec<Option<String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = commands
+            .into_iter()
+            .map(|mut c| {
+                scope.spawn(move || {
+                    let out = c.output().unwrap();
+                    let raw = String::from_utf8_lossy(&out.stdout);
+                    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+                    v["result"]["agent"]["server_epoch"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    for (i, value) in values.iter().enumerate() {
+        let value = value
+            .as_ref()
+            .unwrap_or_else(|| panic!("concurrent read {i} produced no token; refusing a vacuous agreement over an incomplete set"));
+        assert_eq!(
+            value, &reference,
+            "concurrent read {i} disagreed: one incarnation must present one token"
+        );
+    }
+}
+
+/// A FAILED entropy mint must refuse to serve — exit, with the reason, with
+/// no socket — never fall back to a stable or fabricated token. A server that
+/// starts anyway is presenting an incarnation it cannot vouch for, which is
+/// worse than not starting: every consumer's staleness check would then trust
+/// a token that proves nothing.
+///
+/// The starvation is the r18-server-epoch drill's LD_PRELOAD shim,
+/// reconstructed (tests/support/fail_getrandom.c — its provenance header
+/// records the one divergence: it starves crypto-grade `flags == 0` requests,
+/// exactly what the mint's `getrandom::fill` issues, rather than every call,
+/// because std's own hash-key draw now precedes the mint and a total
+/// starvation kills THAT first, pinning a std panic instead of the refusal).
+/// Compiled here at test time. Linux only: LD_PRELOAD symbol interposition is
+/// a Linux mechanism, and it is also where the drill ran.
+///
+/// The drill recorded exit 70 (EX_SOFTWARE) against the pre-commit binary;
+/// the committed tree deliberately chose 69 — EX_UNAVAILABLE, "a required
+/// service is not available" — in `mint_server_epoch_or_exit` (src/main.rs),
+/// blaming the environment rather than the program. This test pins the
+/// committed choice.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_entropy_mint_refuses_to_serve_rather_than_falling_back() {
+    let iso = Isolated::prepare("noent");
+
+    // Build the shim beside the isolated tree, from the committed source.
+    let shim_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fail_getrandom.c");
+    let shim = iso.base.join("fail_getrandom.so");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let build = Command::new(&cc)
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&shim)
+        .arg(&shim_src)
+        .arg("-ldl")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run C compiler {cc}: {e}"));
+    assert!(
+        build.status.success(),
+        "compiling the entropy shim failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    // The server under starvation. Spawned rather than `.output()`: a server
+    // that wrongly starts would never exit, and this test must then FAIL with
+    // the reason rather than hang.
+    let mut cmd = iso.cmd(&["server"]);
+    cmd.env("LD_PRELOAD", &shim);
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if iso.socket.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the server started serving despite a failed entropy mint: fallback token");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the server neither exited nor served under entropy starvation"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        status.code(),
+        Some(69),
+        "a failed mint must exit 69 (EX_UNAVAILABLE), got {status:?}; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot mint the server incarnation token"),
+        "the refusal must say why; stderr: {stderr}"
+    );
+    assert!(
+        !iso.socket.exists(),
+        "a server that refused to start must not have left a listening socket"
+    );
+
+    // The positive/negative pair from the drill: a CLIENT path under the same
+    // shim still works. This is what proves the server's refusal above was
+    // the shim firing on the mint, not the shim breaking the binary wholesale
+    // — without it, exit 69 could be any crash wearing the right code.
+    let mut help = iso.cmd(&["--help"]);
+    help.env("LD_PRELOAD", &shim);
+    let help_out = help.output().unwrap();
+    assert!(
+        help_out.status.success(),
+        "--help must not need the entropy mint; stderr: {}",
+        String::from_utf8_lossy(&help_out.stderr)
+    );
+
+    // `prepare` never started a server, and the refusal must not have either.
+    assert!(
+        iso.server_pids().expect("/proc exists on Linux").is_empty(),
+        "no server process may survive a refused mint"
     );
 }
 
